@@ -302,11 +302,11 @@ mod tests {
         EasySwitchChannel::try_new(number).expect("test channels are non-zero")
     }
 
-    fn switch(edge: Edge, configured: u8) -> Option<EdgeSwitch> {
-        Some(EdgeSwitch {
+    fn switch(edge: Edge, configured: u8) -> EdgeSwitch {
+        EdgeSwitch {
             edge,
             channel: channel(configured),
-        })
+        }
     }
 
     const BOUNDS: Bounds = Bounds {
@@ -368,7 +368,7 @@ mod tests {
                 Some(Edge::Right),
                 &config
             ),
-            switch(Edge::Right, 3)
+            Some(switch(Edge::Right, 3))
         );
     }
 
@@ -379,7 +379,11 @@ mod tests {
         let start = Instant::now();
         tracker.observe(start, Some(Edge::Right), &config);
         let owed = tracker
-            .observe(start + Duration::from_millis(120), Some(Edge::Right), &config)
+            .observe(
+                start + Duration::from_millis(120),
+                Some(Edge::Right),
+                &config,
+            )
             .expect("the dwell has elapsed");
         // `right = 3` is the number printed on the device. Handing that straight
         // to the host-switch manager would land the devices on channel 4.
@@ -420,7 +424,7 @@ mod tests {
                 Some(Edge::Right),
                 &config
             ),
-            switch(Edge::Right, 3)
+            Some(switch(Edge::Right, 3))
         );
     }
 
@@ -449,7 +453,7 @@ mod tests {
                 Some(Edge::Left),
                 &config
             ),
-            switch(Edge::Left, 1)
+            Some(switch(Edge::Left, 1))
         );
     }
 
@@ -465,7 +469,7 @@ mod tests {
                 Some(Edge::Right),
                 &config
             ),
-            switch(Edge::Right, 3)
+            Some(switch(Edge::Right, 3))
         );
         // The transition is still running. However long it takes — the manager
         // budgets ten seconds for the device to leave — a pointer parked on the
@@ -508,7 +512,7 @@ mod tests {
                 Some(Edge::Right),
                 &config
             ),
-            switch(Edge::Right, 3)
+            Some(switch(Edge::Right, 3))
         );
 
         // The transition took 4s; the 1s cooldown therefore runs to 5100ms, not
@@ -546,7 +550,7 @@ mod tests {
                 Some(Edge::Right),
                 &config
             ),
-            switch(Edge::Right, 3)
+            Some(switch(Edge::Right, 3))
         );
     }
 

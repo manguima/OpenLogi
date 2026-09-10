@@ -1425,13 +1425,13 @@ mod tests {
 
         state.accept_request(HostRequest { serial: 1, host: 2 }, &[link(2)], now);
         state.promote_request(&[link(2)], false, now);
-        let stale = state
+        let superseded_source = state
             .begin_transition(false)
             .expect("the first ask should run")
             .source;
 
         state.accept_request(HostRequest { serial: 2, host: 2 }, &[link(2)], now);
-        state.record_transition_outcome(stale, TransitionOutcome::Failed);
+        state.record_transition_outcome(superseded_source, TransitionOutcome::Failed);
 
         assert!(
             state
