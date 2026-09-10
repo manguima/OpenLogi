@@ -5425,8 +5425,11 @@ dependencies = [
  "openlogi-hook",
  "openlogi-inject",
  "openlogi-ipc",
+ "thiserror 2.0.18",
  "tokio",
  "tracing",
+ "windows-sys 0.61.2",
+ "x11rb",
 ]
 
 [[package]]

@@ -37,10 +37,31 @@ struct HostSwitchManagerContext {
     receiver_access: ReceiverAccess,
     receiver_requests: watch::Receiver<ReceiverRequestState>,
     device_io: DeviceIoGate,
+    external_requests: mpsc::UnboundedReceiver<u8>,
     shutdown: oneshot::Receiver<()>,
 }
 
+/// Asks the manager to move a link to a host.
+///
+/// The manager stays the single transition authority: a caller that switched
+/// hosts on its own would race the capture sessions this module owns.
+#[derive(Clone, Debug)]
+pub struct HostSwitchRequester(mpsc::UnboundedSender<u8>);
+
+impl HostSwitchRequester {
+    /// Request a move to `host`, the 0-based index `CHANGE_HOST` addresses.
+    ///
+    /// Dropped silently once the manager has shut down; a failed request is
+    /// indistinguishable from an unpaired slot to the caller either way.
+    pub fn request(&self, host: u8) {
+        let _ = self.0.send(host);
+    }
+}
+
 /// Spawn the host switch session manager.
+///
+/// The requester is how anything other than an Easy-Switch key press asks for
+/// a transition; dropping it leaves key presses as the only trigger.
 #[must_use]
 pub fn spawn(
     links: &HostSwitchLinks,
@@ -48,11 +69,12 @@ pub fn spawn(
     receiver_access: ReceiverAccess,
     registry: ChannelRegistry,
     device_io: DeviceIoGate,
-) -> WatcherHandle {
+) -> (WatcherHandle, HostSwitchRequester) {
     let links = links.clone();
     let receiver_requests = receiver_access.subscribe_requests();
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
     let (shutdown_done_tx, shutdown_done_rx) = oneshot::channel();
+    let (requests_tx, requests_rx) = mpsc::unbounded_channel();
     thread::spawn(move || {
         let runtime = match tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -72,6 +94,7 @@ pub fn spawn(
             receiver_access,
             receiver_requests,
             device_io,
+            external_requests: requests_rx,
             shutdown: shutdown_rx,
         }));
         // A manager return can strand detached task supervisors. Destroy their
@@ -79,7 +102,10 @@ pub fn spawn(
         drop(runtime);
         let _ = shutdown_done_tx.send(completion);
     });
-    WatcherHandle::new(shutdown_tx, shutdown_done_rx)
+    (
+        WatcherHandle::new(shutdown_tx, shutdown_done_rx),
+        HostSwitchRequester(requests_tx),
+    )
 }
 
 enum SessionPhase {
@@ -218,6 +244,22 @@ impl HostSwitchManagerState {
         ) {
             self.transition = None;
         }
+    }
+
+    /// Queue a transition asked for by something other than a key press.
+    ///
+    /// The waiting slot holds one intent, so a caller that can ask faster than
+    /// a transition completes overwrites nothing and queues nothing — the
+    /// request is simply dropped while another is in flight.
+    fn request_transition(&mut self, published: &[HostSwitchLink], host: u8) {
+        if self.transition.is_some() {
+            debug!(host, "host switch request ignored — a transition is in flight");
+            return;
+        }
+        let Some(link) = published.first().cloned() else {
+            return;
+        };
+        self.transition = Some(TransitionPhase::Waiting(TransitionIntent { link, host }));
     }
 
     fn begin_transition(&mut self, terminal: bool) -> Option<TransitionIntent> {
@@ -444,6 +486,7 @@ async fn manage(context: HostSwitchManagerContext) -> ManagerCompletion {
         receiver_access,
         mut receiver_requests,
         mut device_io,
+        mut external_requests,
         mut shutdown,
     } = context;
     let (events, mut event_rx) = mpsc::unbounded_channel();
@@ -492,6 +535,10 @@ async fn manage(context: HostSwitchManagerContext) -> ManagerCompletion {
 
             _ = &mut shutdown, if !terminal => {
                 terminal = true;
+            }
+            Some(host) = external_requests.recv(), if !terminal => {
+                let published = links.borrow().clone();
+                state.request_transition(&published, host);
             }
             Some(event) = event_rx.recv() => {
                 let published = links.borrow().clone();
