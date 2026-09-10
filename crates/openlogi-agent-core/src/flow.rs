@@ -10,6 +10,8 @@
 //! This module is the pure half — the message and the geometry. Discovery and
 //! transport live in the children.
 
+pub mod seal;
+
 use openlogi_core::config::Edge;
 use serde::{Deserialize, Serialize};
 

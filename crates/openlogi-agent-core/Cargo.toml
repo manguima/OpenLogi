@@ -21,6 +21,8 @@ serde = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
+hmac = "0.12"
+sha2 = "0.10"
 
 # Pointer reads for the flow edge watcher. Matches the version openlogi-hook
 # already pins, so the graph keeps one x11rb.

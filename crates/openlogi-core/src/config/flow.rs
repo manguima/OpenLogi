@@ -25,6 +25,32 @@ pub enum Edge {
 impl Edge {
     /// Every edge, in the order the watcher tests them.
     pub const ALL: [Self; 4] = [Self::Left, Self::Right, Self::Top, Self::Bottom];
+
+    /// The byte that names this edge on the wire.
+    ///
+    /// Spelled out rather than derived from the declaration order, so
+    /// reordering the variants cannot silently change what a peer receives.
+    #[must_use]
+    pub fn code(self) -> u8 {
+        match self {
+            Self::Left => 0,
+            Self::Right => 1,
+            Self::Top => 2,
+            Self::Bottom => 3,
+        }
+    }
+
+    /// The edge a wire byte names, if it names one.
+    #[must_use]
+    pub fn from_code(code: u8) -> Option<Self> {
+        match code {
+            0 => Some(Self::Left),
+            1 => Some(Self::Right),
+            2 => Some(Self::Top),
+            3 => Some(Self::Bottom),
+            _ => None,
+        }
+    }
 }
 
 /// A host as the user names it: the 1-based Easy-Switch channel printed on
@@ -184,6 +210,15 @@ mod tests {
             ..FlowConfig::default()
         };
         assert!(!config.is_active());
+    }
+
+    #[test]
+    fn every_edge_round_trips_through_its_wire_byte() {
+        for edge in Edge::ALL {
+            assert_eq!(Edge::from_code(edge.code()), Some(edge));
+        }
+        assert_eq!(Edge::from_code(4), None);
+        assert_eq!(Edge::from_code(u8::MAX), None);
     }
 
     #[test]

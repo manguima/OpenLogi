@@ -5419,12 +5419,15 @@ name = "openlogi-agent-core"
 version = "0.8.3"
 dependencies = [
  "futures-lite",
+ "hmac",
  "openlogi-core",
  "openlogi-fixture",
  "openlogi-hid",
  "openlogi-hook",
  "openlogi-inject",
  "openlogi-ipc",
+ "serde",
+ "sha2 0.10.9",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
