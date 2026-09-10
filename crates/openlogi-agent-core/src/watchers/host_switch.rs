@@ -712,7 +712,7 @@ async fn manage(context: HostSwitchManagerContext) -> ManagerCompletion {
         receiver_access,
         mut receiver_requests,
         mut device_io,
-        requests: mut external_requests,
+        requests: mut asks,
         settlements,
         mut shutdown,
     } = context;
@@ -733,19 +733,7 @@ async fn manage(context: HostSwitchManagerContext) -> ManagerCompletion {
         let requests = *receiver_requests.borrow_and_update();
         let published = std::sync::Arc::clone(&links.borrow_and_update());
         let io_allowed = device_io.allows_io();
-        let now = Instant::now();
-        if let Some(ask) = *external_requests.borrow_and_update() {
-            state.accept_request(ask, &published, now);
-        }
-        state.reconcile_transition(&published, terminal);
-        state.promote_request(&published, terminal, now);
-        let _ = settlements.send_if_modified(|reported| {
-            let advanced = *reported < state.settled;
-            if advanced {
-                *reported = state.settled;
-            }
-            advanced
-        });
+        service_asks(&mut state, &mut asks, &settlements, &published, terminal);
         let wanted = if terminal || requests.any() || state.transition.is_some() {
             &[][..]
         } else {
@@ -780,7 +768,7 @@ async fn manage(context: HostSwitchManagerContext) -> ManagerCompletion {
                 let published = links.borrow().clone();
                 handle_manager_event(&mut state, event, &published, terminal);
             }
-            result = external_requests.changed(), if requests_open => {
+            result = asks.changed(), if requests_open => {
                 if result.is_err() {
                     // Every requester is gone, so Easy-Switch key presses are
                     // the only trigger left. Disable the arm: a closed watch
@@ -811,6 +799,45 @@ async fn manage(context: HostSwitchManagerContext) -> ManagerCompletion {
             () = wait_for_deadline(deadline) => {}
         }
     }
+}
+
+/// Service the external-request protocol for one turn of the manager loop:
+/// take in whatever ask is published, let the state machine reconcile and
+/// promote it, then report how far settlement has advanced.
+///
+/// The steps are one unit because their order *is* the protocol. Intake runs
+/// first so a fresh ask supersedes its predecessor before the same turn
+/// reconciles and promotes it; run the other way round, an ask would always sit
+/// out the iteration it arrived on. Publication runs last so a serial this turn
+/// retired releases its caller straight away, rather than leaving
+/// [`HostSwitchRequester::request`] parked until some unrelated event happens to
+/// wake the loop again — which is what keeps a polling caller from asking twice
+/// for one move.
+///
+/// It is a free function rather than a [`HostSwitchManagerState`] method so the
+/// state machine keeps knowing nothing about the watch channels: the loop owns
+/// those, and the tests drive these same transitions by calling the methods
+/// directly.
+fn service_asks(
+    state: &mut HostSwitchManagerState,
+    asks: &mut watch::Receiver<Option<HostRequest>>,
+    settlements: &watch::Sender<u64>,
+    published: &[HostSwitchLink],
+    terminal: bool,
+) {
+    let now = Instant::now();
+    if let Some(ask) = *asks.borrow_and_update() {
+        state.accept_request(ask, published, now);
+    }
+    state.reconcile_transition(published, terminal);
+    state.promote_request(published, terminal, now);
+    let _ = settlements.send_if_modified(|reported| {
+        let advanced = *reported < state.settled;
+        if advanced {
+            *reported = state.settled;
+        }
+        advanced
+    });
 }
 
 fn handle_manager_event(
