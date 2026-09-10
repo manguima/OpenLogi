@@ -1,5 +1,6 @@
 //! Keep configured keyboard → pointing-device host-switch links armed.
 
+use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
@@ -16,6 +17,13 @@ use crate::receiver_access::{ExclusiveAccessReason, ReceiverAccess, ReceiverRequ
 
 const DEPARTURE_TIMEOUT: Duration = Duration::from_secs(10);
 const RETRY_DELAY: Duration = Duration::from_secs(1);
+/// Dead time after one externally requested move fails.
+const REQUEST_BACKOFF_BASE: Duration = Duration::from_secs(2);
+/// Ceiling for the doubling below, so a permanently deaf host still gets
+/// retried when the user asks again minutes later.
+const REQUEST_BACKOFF_MAX: Duration = Duration::from_secs(60);
+/// Doublings applied to [`REQUEST_BACKOFF_BASE`] before the ceiling bites.
+const REQUEST_BACKOFF_DOUBLINGS: u32 = 5;
 
 /// One resolved link. Config keys are converted to live routes by the
 /// orchestrator so the transport watcher never needs to understand inventory.
@@ -30,20 +38,63 @@ pub struct HostSwitchLink {
 /// Read-only, lossless, coalescing view of resolved links.
 pub type HostSwitchLinks = watch::Receiver<std::sync::Arc<Vec<HostSwitchLink>>>;
 
+/// One ask, tagged so that repeating the same host still reads as new work.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct HostRequest {
+    /// Monotonic id. Also what a caller waits to see settled.
+    serial: u64,
+    /// 1-based Easy-Switch channel.
+    host: u8,
+}
+
 /// Asks the manager to move every configured link to a host.
 ///
 /// The manager stays the single transition authority: a caller that switched
 /// hosts on its own would race the capture sessions this module owns.
-#[derive(Clone, Debug)]
-pub struct HostSwitchRequester(mpsc::UnboundedSender<u8>);
+///
+/// Asks coalesce into one slot rather than queueing. A host move is idempotent
+/// and only-latest-matters, so a backlog of stale asks is not work to catch up
+/// on — it is a caller outrunning the hardware, and every entry in it costs
+/// another exclusive receiver lease. The single slot plus [`Self::request`]
+/// waiting for settlement caps a caller at one ask in flight whatever rate it
+/// polls at.
+#[derive(Clone)]
+pub struct HostSwitchRequester {
+    asks: Arc<watch::Sender<Option<HostRequest>>>,
+    settled: watch::Receiver<u64>,
+}
+
+impl std::fmt::Debug for HostSwitchRequester {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("HostSwitchRequester")
+            .finish_non_exhaustive()
+    }
+}
 
 impl HostSwitchRequester {
-    /// Request a move to the 1-based Easy-Switch channel `host`.
+    /// Request a move to the 1-based Easy-Switch channel `host`, resolving once
+    /// the manager has finished acting on it.
     ///
-    /// Dropped silently once the manager has shut down; a failed request is
-    /// indistinguishable from an unpaired slot to the caller either way.
-    pub fn request(&self, host: u8) {
-        let _ = self.0.send(host);
+    /// Settled means carried out, superseded by a later ask, throttled after
+    /// repeated failures, or abandoned because the manager shut down. A caller
+    /// therefore measures its own dead time from the end of the transition
+    /// rather than from the ask, which is the only way a poll loop can be
+    /// structurally unable to queue a second move behind the first.
+    pub async fn request(&self, host: u8) {
+        let mut settled = self.settled.clone();
+        let mut serial = 0;
+        // Assigning the serial inside the send keeps the id and the slot in one
+        // critical section, so concurrent callers cannot publish out of order.
+        self.asks.send_modify(|slot| {
+            serial = slot.map_or(1, |previous| previous.serial.saturating_add(1));
+            *slot = Some(HostRequest { serial, host });
+        });
+        while *settled.borrow_and_update() < serial {
+            if settled.changed().await.is_err() {
+                return;
+            }
+        }
     }
 }
 
@@ -54,7 +105,8 @@ struct HostSwitchManagerContext {
     receiver_access: ReceiverAccess,
     receiver_requests: watch::Receiver<ReceiverRequestState>,
     device_io: DeviceIoGate,
-    requests: mpsc::UnboundedReceiver<u8>,
+    requests: watch::Receiver<Option<HostRequest>>,
+    settlements: watch::Sender<u64>,
     shutdown: oneshot::Receiver<()>,
 }
 
@@ -72,7 +124,8 @@ pub fn spawn(
 ) -> (WatcherHandle, HostSwitchRequester) {
     let links = links.clone();
     let receiver_requests = receiver_access.subscribe_requests();
-    let (requests_tx, requests_rx) = mpsc::unbounded_channel();
+    let (requests_tx, requests_rx) = watch::channel(None);
+    let (settlements_tx, settlements_rx) = watch::channel(0);
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
     let (shutdown_done_tx, shutdown_done_rx) = oneshot::channel();
     thread::spawn(move || {
@@ -95,6 +148,7 @@ pub fn spawn(
             receiver_requests,
             device_io,
             requests: requests_rx,
+            settlements: settlements_tx,
             shutdown: shutdown_rx,
         }));
         // A manager return can strand detached task supervisors. Destroy their
@@ -104,7 +158,10 @@ pub fn spawn(
     });
     (
         WatcherHandle::new(shutdown_tx, shutdown_done_rx),
-        HostSwitchRequester(requests_tx),
+        HostSwitchRequester {
+            asks: Arc::new(requests_tx),
+            settled: settlements_rx,
+        },
     )
 }
 
@@ -163,15 +220,40 @@ impl HostSwitchSlot {
     }
 }
 
+/// What asked for a transition.
+///
+/// A request carries the ask's serial so a completion cannot be charged to the
+/// ask that superseded it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TransitionSource {
+    /// An Easy-Switch key press observed by a capture session.
+    KeyPress,
+    /// An external ask through [`HostSwitchRequester`].
+    Request {
+        /// Serial of the ask this transition belongs to.
+        serial: u64,
+    },
+}
+
+/// What one transition attempt achieved.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TransitionOutcome {
+    /// The keyboard left this host, or there was nothing to do.
+    Settled,
+    /// The write was rejected, or the keyboard never left within the budget.
+    Failed,
+}
+
 #[derive(Clone)]
 struct TransitionIntent {
     link: HostSwitchLink,
     host: u8,
+    source: TransitionSource,
 }
 
 enum TransitionPhase {
     Waiting(TransitionIntent),
-    Running,
+    Running(TransitionSource),
 }
 
 struct SessionCompletion {
@@ -193,7 +275,7 @@ struct RestoreCompletion {
 enum ManagerEvent {
     Session(SessionCompletion),
     Restore(RestoreCompletion),
-    Transition(Result<(), tokio::task::JoinError>),
+    Transition(Result<TransitionOutcome, tokio::task::JoinError>),
 }
 
 struct SessionServices {
@@ -204,13 +286,52 @@ struct SessionServices {
     events: mpsc::UnboundedSender<ManagerEvent>,
 }
 
+/// Consecutive-failure throttle for externally requested host moves.
+///
+/// A host that will not accept the switch must not cost a fresh exclusive
+/// receiver lease — and up to [`DEPARTURE_TIMEOUT`] of starved HID++ sessions —
+/// on every ask. Each consecutive failure doubles the dead time before another
+/// attempt is allowed; a success, or an ask for a different host, clears it.
+#[derive(Debug, Default)]
+struct RequestBackoff {
+    host: Option<u8>,
+    failures: u32,
+    blocked_until: Option<Instant>,
+}
+
+impl RequestBackoff {
+    fn blocks(&self, host: u8, now: Instant) -> bool {
+        self.host == Some(host) && self.blocked_until.is_some_and(|until| now < until)
+    }
+
+    fn record(&mut self, host: u8, failed: bool, now: Instant) {
+        if self.host != Some(host) {
+            self.host = Some(host);
+            self.failures = 0;
+        }
+        if !failed {
+            self.failures = 0;
+            self.blocked_until = None;
+            return;
+        }
+        self.failures = self.failures.saturating_add(1);
+        let doublings = self.failures.saturating_sub(1).min(REQUEST_BACKOFF_DOUBLINGS);
+        let delay = REQUEST_BACKOFF_BASE
+            .saturating_mul(2u32.saturating_pow(doublings))
+            .min(REQUEST_BACKOFF_MAX);
+        self.blocked_until = Some(now + delay);
+    }
+}
+
 /// An outstanding request to move every link to one host.
 ///
 /// Links move one at a time through the same transition slot an Easy-Switch
-/// press uses, so `remaining` is what is left of the ask, not a queue of asks.
+/// press uses, so `remaining` is what is left of one ask, not a queue of asks.
 struct PendingRequest {
+    serial: u64,
     host: u8,
     remaining: Vec<HostSwitchLink>,
+    failed: bool,
 }
 
 struct HostSwitchManagerState {
@@ -218,6 +339,11 @@ struct HostSwitchManagerState {
     next_generation: u64,
     transition: Option<TransitionPhase>,
     request: Option<PendingRequest>,
+    backoff: RequestBackoff,
+    /// Highest ask serial already taken on, so re-reads are idempotent.
+    seen: u64,
+    /// Highest ask serial the manager is finished with.
+    settled: u64,
     task_failed: bool,
 }
 
@@ -228,23 +354,60 @@ impl HostSwitchManagerState {
             next_generation: 0,
             transition: None,
             request: None,
+            backoff: RequestBackoff::default(),
+            seen: 0,
+            settled: 0,
             task_failed: false,
         }
     }
 
-    /// Record an externally requested move, superseding any earlier one.
-    fn accept_request(&mut self, host: u8, published: &[HostSwitchLink]) {
+    /// Take on an externally requested move, superseding any earlier one.
+    ///
+    /// Re-reading the published ask is a no-op: only a serial past the highest
+    /// one already taken on is new work.
+    fn accept_request(&mut self, ask: HostRequest, published: &[HostSwitchLink], now: Instant) {
+        if ask.serial <= self.seen {
+            return;
+        }
+        self.seen = ask.serial;
+        // Only the latest ask matters. Retiring the older one releases its
+        // caller; it says nothing about the host, so it does not charge the
+        // throttle. A transition already running for it keeps its own serial
+        // and its outcome is discarded when it lands.
+        if let Some(superseded) = self.request.take() {
+            self.settled = self.settled.max(superseded.serial);
+        }
+        if matches!(
+            &self.transition,
+            Some(TransitionPhase::Waiting(intent))
+                if matches!(intent.source, TransitionSource::Request { .. })
+        ) {
+            self.transition = None;
+        }
+        if self.backoff.blocks(ask.host, now) {
+            debug!(
+                host = ask.host,
+                "host switch request throttled after repeated failures"
+            );
+            self.settled = self.settled.max(ask.serial);
+            return;
+        }
         self.request = Some(PendingRequest {
-            host,
+            serial: ask.serial,
+            host: ask.host,
             remaining: published.to_vec(),
+            failed: false,
         });
     }
 
     /// Hand the outstanding request's next still-published link to the
-    /// transition slot, so it travels the same path a key press does.
-    fn promote_request(&mut self, published: &[HostSwitchLink], terminal: bool) {
+    /// transition slot, so it travels the same path a key press does, and
+    /// retire the request once nothing is left to move.
+    fn promote_request(&mut self, published: &[HostSwitchLink], terminal: bool, now: Instant) {
         if terminal {
-            self.request = None;
+            if let Some(abandoned) = self.request.take() {
+                self.settled = self.settled.max(abandoned.serial);
+            }
             return;
         }
         if self.transition.is_some() {
@@ -258,11 +421,41 @@ impl HostSwitchManagerState {
                 self.transition = Some(TransitionPhase::Waiting(TransitionIntent {
                     link,
                     host: request.host,
+                    source: TransitionSource::Request {
+                        serial: request.serial,
+                    },
                 }));
                 return;
             }
         }
-        self.request = None;
+        self.finish_request(now);
+    }
+
+    /// Charge the throttle for the finished ask and release its caller.
+    fn finish_request(&mut self, now: Instant) {
+        let Some(request) = self.request.take() else {
+            return;
+        };
+        self.backoff.record(request.host, request.failed, now);
+        self.settled = self.settled.max(request.serial);
+    }
+
+    /// Fold a landed transition into the ask that started it.
+    ///
+    /// A completion for a superseded ask is dropped: the successor owns the
+    /// slot and must not inherit its predecessor's verdict.
+    fn record_transition_outcome(&mut self, source: TransitionSource, outcome: TransitionOutcome) {
+        let TransitionSource::Request { serial } = source else {
+            return;
+        };
+        let Some(request) = self
+            .request
+            .as_mut()
+            .filter(|request| request.serial == serial)
+        else {
+            return;
+        };
+        request.failed |= outcome == TransitionOutcome::Failed;
     }
 
     fn has_pending_restores(&self) -> bool {
@@ -300,7 +493,7 @@ impl HostSwitchManagerState {
         else {
             return None;
         };
-        self.transition = Some(TransitionPhase::Running);
+        self.transition = Some(TransitionPhase::Running(intent.source));
         Some(intent)
     }
 
@@ -458,6 +651,7 @@ impl HostSwitchManagerState {
             self.transition = Some(TransitionPhase::Waiting(TransitionIntent {
                 link: session.link,
                 host,
+                source: TransitionSource::KeyPress,
             }));
         } else if result.failed && request_is_current {
             self.slots.push(HostSwitchSlot::Restarting {
@@ -495,6 +689,7 @@ impl HostSwitchManagerState {
                     self.transition = Some(TransitionPhase::Waiting(TransitionIntent {
                         link: recovery.link,
                         host,
+                        source: TransitionSource::KeyPress,
                     }));
                 }
             }
@@ -515,6 +710,7 @@ async fn manage(context: HostSwitchManagerContext) -> ManagerCompletion {
         mut receiver_requests,
         mut device_io,
         requests: mut external_requests,
+        settlements,
         mut shutdown,
     } = context;
     let (events, mut event_rx) = mpsc::unbounded_channel();
@@ -528,13 +724,25 @@ async fn manage(context: HostSwitchManagerContext) -> ManagerCompletion {
     };
     let mut state = HostSwitchManagerState::new();
     let mut terminal = false;
+    let mut requests_open = true;
 
     loop {
         let requests = *receiver_requests.borrow_and_update();
         let published = std::sync::Arc::clone(&links.borrow_and_update());
         let io_allowed = device_io.allows_io();
+        let now = Instant::now();
+        if let Some(ask) = *external_requests.borrow_and_update() {
+            state.accept_request(ask, &published, now);
+        }
         state.reconcile_transition(&published, terminal);
-        state.promote_request(&published, terminal);
+        state.promote_request(&published, terminal, now);
+        let _ = settlements.send_if_modified(|reported| {
+            let advanced = *reported < state.settled;
+            if advanced {
+                *reported = state.settled;
+            }
+            advanced
+        });
         let wanted = if terminal || requests.any() || state.transition.is_some() {
             &[][..]
         } else {
@@ -569,9 +777,13 @@ async fn manage(context: HostSwitchManagerContext) -> ManagerCompletion {
                 let published = links.borrow().clone();
                 handle_manager_event(&mut state, event, &published, terminal);
             }
-            Some(host) = external_requests.recv(), if !terminal => {
-                let published = links.borrow().clone();
-                state.accept_request(host, &published);
+            result = external_requests.changed(), if requests_open => {
+                if result.is_err() {
+                    // Every requester is gone, so Easy-Switch key presses are
+                    // the only trigger left. Disable the arm: a closed watch
+                    // resolves instantly and would otherwise spin the loop.
+                    requests_open = false;
+                }
             }
             result = links.changed() => {
                 if result.is_err() {
@@ -612,11 +824,25 @@ fn handle_manager_event(
             state.handle_restore_completion(completion, published, terminal);
         }
         ManagerEvent::Transition(result) => {
-            if let Err(error) = result {
-                warn!(%error, "host transition task failed");
-                state.task_failed = true;
-            }
-            state.transition = None;
+            let source = match state.transition.take() {
+                Some(TransitionPhase::Running(source)) => source,
+                // Only `begin_transition` spawns a transition, and it always
+                // installs `Running`; anything else means the slot no longer
+                // describes this completion, so leave it as it stands.
+                other => {
+                    state.transition = other;
+                    return;
+                }
+            };
+            let outcome = match result {
+                Ok(outcome) => outcome,
+                Err(error) => {
+                    warn!(%error, "host transition task failed");
+                    state.task_failed = true;
+                    TransitionOutcome::Failed
+                }
+            };
+            state.record_transition_outcome(source, outcome);
         }
     }
 }
@@ -706,12 +932,12 @@ async fn run_transition(
     receiver_access: ReceiverAccess,
     device_io: DeviceIoGate,
     intent: TransitionIntent,
-) {
+) -> TransitionOutcome {
     let _lease = receiver_access
         .acquire_exclusive(ExclusiveAccessReason::HostTransition)
         .await;
     if !device_io.allows_io() || !links.borrow().contains(&intent.link) {
-        return;
+        return TransitionOutcome::Settled;
     }
     match switch_linked_hosts(
         &intent.link.keyboard,
@@ -721,10 +947,18 @@ async fn run_transition(
     )
     .await
     {
-        Ok(true) => wait_for_departure(&mut links, &intent.link.keyboard).await,
-        Ok(false) => {}
+        Ok(true) => {
+            if wait_for_departure(&mut links, &intent.link.keyboard).await {
+                TransitionOutcome::Settled
+            } else {
+                TransitionOutcome::Failed
+            }
+        }
+        // Already on that host: nothing moved, and nothing is wrong.
+        Ok(false) => TransitionOutcome::Settled,
         Err(error) => {
             debug!(%error, route = %intent.link.keyboard, host = intent.host, "keyboard host switch failed");
+            TransitionOutcome::Failed
         }
     }
 }
@@ -750,7 +984,8 @@ async fn wait_for_deadline(deadline: Option<Instant>) {
     }
 }
 
-async fn wait_for_departure(links: &mut HostSwitchLinks, keyboard: &DeviceRoute) {
+/// Whether the keyboard left this host within [`DEPARTURE_TIMEOUT`].
+async fn wait_for_departure(links: &mut HostSwitchLinks, keyboard: &DeviceRoute) -> bool {
     let deadline = tokio::time::sleep(DEPARTURE_TIMEOUT);
     tokio::pin!(deadline);
     loop {
@@ -759,17 +994,17 @@ async fn wait_for_departure(links: &mut HostSwitchLinks, keyboard: &DeviceRoute)
             .iter()
             .any(|link| link.keyboard == *keyboard);
         if departed {
-            return;
+            return true;
         }
         tokio::select! {
             result = links.changed() => {
                 if result.is_err() {
-                    return;
+                    return false;
                 }
             }
             () = &mut deadline => {
                 warn!(route = %keyboard, "host transition departure was not observed");
-                return;
+                return false;
             }
         }
     }
@@ -820,6 +1055,7 @@ mod tests {
         state.transition = Some(TransitionPhase::Waiting(TransitionIntent {
             link: link(2),
             host: 1,
+            source: TransitionSource::KeyPress,
         }));
 
         state.reconcile_transition(&[link(3)], false);
@@ -892,6 +1128,7 @@ mod tests {
         state.transition = Some(TransitionPhase::Waiting(TransitionIntent {
             link: link(2),
             host: 2,
+            source: TransitionSource::KeyPress,
         }));
         assert!(state.begin_transition(false).is_none());
         assert!(matches!(
@@ -911,7 +1148,12 @@ mod tests {
         // Another manager wake while switching must not remove Running.
         assert!(state.begin_transition(false).is_none());
         assert!(state.terminal_completion(true).is_none());
-        handle_manager_event(&mut state, ManagerEvent::Transition(Ok(())), &[], true);
+        handle_manager_event(
+            &mut state,
+            ManagerEvent::Transition(Ok(TransitionOutcome::Settled)),
+            &[],
+            true,
+        );
         assert!(matches!(
             state.terminal_completion(true),
             Some(ManagerCompletion::Graceful)
@@ -963,6 +1205,296 @@ mod tests {
             Some(retry_at)
         );
         assert_eq!(state.deadline(ReceiverRequestState::default(), false), None);
+    }
+
+    fn requester_pair() -> (
+        HostSwitchRequester,
+        watch::Receiver<Option<HostRequest>>,
+        watch::Sender<u64>,
+    ) {
+        let (asks, ask_rx) = watch::channel(None);
+        let (settlements, settled_rx) = watch::channel(0);
+        (
+            HostSwitchRequester {
+                asks: Arc::new(asks),
+                settled: settled_rx,
+            },
+            ask_rx,
+            settlements,
+        )
+    }
+
+    #[tokio::test]
+    async fn an_ask_only_resolves_once_the_manager_settles_it() {
+        let (requester, asks, settlements) = requester_pair();
+        let asking = tokio::spawn(async move { requester.request(3).await });
+        tokio::task::yield_now().await;
+
+        assert_eq!(*asks.borrow(), Some(HostRequest { serial: 1, host: 3 }));
+        assert!(
+            !asking.is_finished(),
+            "a caller parked until the transition ends is what makes its own \
+             cooldown cover the transition rather than only the ask"
+        );
+
+        settlements.send_replace(1);
+        asking.await.expect("a settled ask should resolve");
+    }
+
+    #[tokio::test]
+    async fn concurrent_asks_coalesce_into_the_latest_one() {
+        let (requester, asks, settlements) = requester_pair();
+        let first = tokio::spawn({
+            let requester = requester.clone();
+            async move { requester.request(2).await }
+        });
+        tokio::task::yield_now().await;
+        let second = tokio::spawn(async move { requester.request(3).await });
+        tokio::task::yield_now().await;
+
+        assert_eq!(
+            *asks.borrow(),
+            Some(HostRequest { serial: 2, host: 3 }),
+            "only the latest ask may survive; a stale host move is not work",
+        );
+
+        // Settling the newer serial releases the superseded caller too.
+        settlements.send_replace(2);
+        first.await.expect("the superseded ask should resolve");
+        second.await.expect("the latest ask should resolve");
+    }
+
+    #[tokio::test]
+    async fn a_departed_manager_releases_a_waiting_ask() {
+        let (requester, _asks, settlements) = requester_pair();
+        let asking = tokio::spawn(async move { requester.request(2).await });
+        tokio::task::yield_now().await;
+
+        drop(settlements);
+        asking
+            .await
+            .expect("a caller must not hang when the manager is gone");
+    }
+
+    #[test]
+    fn an_ask_moves_every_published_link_through_the_one_transition_slot() {
+        let now = Instant::now();
+        let published = [link(2), link(3)];
+        let mut state = HostSwitchManagerState::new();
+
+        state.accept_request(HostRequest { serial: 1, host: 3 }, &published, now);
+        state.promote_request(&published, false, now);
+        let first = state.begin_transition(false).expect("the ask should run");
+        assert_eq!(first.host, 3);
+        assert!(
+            state.begin_transition(false).is_none(),
+            "the manager stays the single transition authority",
+        );
+
+        handle_manager_event(
+            &mut state,
+            ManagerEvent::Transition(Ok(TransitionOutcome::Settled)),
+            &published,
+            false,
+        );
+        state.promote_request(&published, false, now);
+        let second = state
+            .begin_transition(false)
+            .expect("the second link should move");
+        assert_eq!(second.host, 3);
+        assert_eq!(state.settled, 0, "the ask is not settled while work remains");
+
+        handle_manager_event(
+            &mut state,
+            ManagerEvent::Transition(Ok(TransitionOutcome::Settled)),
+            &published,
+            false,
+        );
+        state.promote_request(&published, false, now);
+        assert!(state.request.is_none());
+        assert_eq!(
+            state.settled, 1,
+            "the caller is released once nothing is left to move"
+        );
+    }
+
+    #[test]
+    fn re_reading_the_published_ask_does_not_restart_it() {
+        let ask = HostRequest { serial: 1, host: 2 };
+        let now = Instant::now();
+        let mut state = HostSwitchManagerState::new();
+
+        state.accept_request(ask, &[link(2)], now);
+        state.promote_request(&[link(2)], false, now);
+        assert_eq!(
+            state.begin_transition(false).expect("the ask should run").host,
+            2
+        );
+
+        // The watch keeps holding the same value on every later manager wake.
+        state.accept_request(ask, &[link(2)], now);
+        assert_eq!(state.settled, 0);
+        assert!(
+            state
+                .request
+                .as_ref()
+                .is_some_and(|request| request.serial == 1 && request.remaining.is_empty()),
+            "an already-accepted ask must not be taken on twice",
+        );
+    }
+
+    #[test]
+    fn a_later_ask_supersedes_the_pending_one_and_releases_its_caller() {
+        let now = Instant::now();
+        let mut state = HostSwitchManagerState::new();
+
+        state.accept_request(HostRequest { serial: 1, host: 2 }, &[link(2)], now);
+        state.promote_request(&[link(2)], false, now);
+        assert!(matches!(
+            state.transition,
+            Some(TransitionPhase::Waiting(_))
+        ));
+
+        state.accept_request(HostRequest { serial: 2, host: 3 }, &[link(2)], now);
+        assert_eq!(state.settled, 1, "the superseded ask must release its caller");
+        assert!(
+            state.transition.is_none(),
+            "a queued intent for a superseded ask is a stale host move",
+        );
+
+        state.promote_request(&[link(2)], false, now);
+        assert_eq!(
+            state
+                .begin_transition(false)
+                .expect("the newest ask should run")
+                .host,
+            3
+        );
+    }
+
+    #[test]
+    fn a_superseded_asks_outcome_is_not_charged_to_its_successor() {
+        let now = Instant::now();
+        let mut state = HostSwitchManagerState::new();
+
+        state.accept_request(HostRequest { serial: 1, host: 2 }, &[link(2)], now);
+        state.promote_request(&[link(2)], false, now);
+        let stale = state
+            .begin_transition(false)
+            .expect("the first ask should run")
+            .source;
+
+        state.accept_request(HostRequest { serial: 2, host: 2 }, &[link(2)], now);
+        state.record_transition_outcome(stale, TransitionOutcome::Failed);
+
+        assert!(
+            state.request.as_ref().is_some_and(|request| !request.failed),
+            "the successor owns the slot and must not inherit the verdict",
+        );
+    }
+
+    #[test]
+    fn repeated_failures_throttle_the_next_ask_instead_of_taking_the_lease() {
+        let now = Instant::now();
+        let mut state = HostSwitchManagerState::new();
+
+        state.accept_request(HostRequest { serial: 1, host: 2 }, &[link(2)], now);
+        state.promote_request(&[link(2)], false, now);
+        let intent = state.begin_transition(false).expect("the ask should run");
+        assert_eq!(intent.host, 2);
+        handle_manager_event(
+            &mut state,
+            ManagerEvent::Transition(Ok(TransitionOutcome::Failed)),
+            &[link(2)],
+            false,
+        );
+        state.promote_request(&[link(2)], false, now);
+        assert_eq!(state.settled, 1);
+
+        state.accept_request(HostRequest { serial: 2, host: 2 }, &[link(2)], now);
+        assert!(
+            state.request.is_none(),
+            "a throttled ask must not cost another exclusive lease",
+        );
+        assert_eq!(state.settled, 2, "a throttled ask still releases its caller");
+        state.promote_request(&[link(2)], false, now);
+        assert!(state.transition.is_none());
+
+        // A different host was never the one refusing, so it is not throttled.
+        state.accept_request(HostRequest { serial: 3, host: 3 }, &[link(2)], now);
+        assert!(state.request.is_some());
+    }
+
+    #[test]
+    fn each_consecutive_failure_doubles_the_dead_time_up_to_the_ceiling() {
+        let now = Instant::now();
+        let mut backoff = RequestBackoff::default();
+
+        backoff.record(2, true, now);
+        assert!(backoff.blocks(2, now + REQUEST_BACKOFF_BASE - Duration::from_millis(1)));
+        assert!(!backoff.blocks(2, now + REQUEST_BACKOFF_BASE));
+        assert!(!backoff.blocks(3, now), "only the refusing host is throttled");
+
+        backoff.record(2, true, now);
+        assert!(backoff.blocks(2, now + REQUEST_BACKOFF_BASE));
+
+        for _ in 0..32 {
+            backoff.record(2, true, now);
+        }
+        assert!(
+            !backoff.blocks(2, now + REQUEST_BACKOFF_MAX),
+            "the dead time is capped so a later deliberate ask still runs",
+        );
+
+        backoff.record(2, false, now);
+        assert!(!backoff.blocks(2, now), "a success clears the throttle");
+    }
+
+    #[test]
+    fn a_terminal_manager_releases_the_outstanding_ask() {
+        let now = Instant::now();
+        let mut state = HostSwitchManagerState::new();
+
+        state.accept_request(HostRequest { serial: 1, host: 2 }, &[link(2)], now);
+        state.promote_request(&[link(2)], true, now);
+        assert!(state.request.is_none());
+        assert_eq!(state.settled, 1);
+        assert!(state.transition.is_none());
+        assert!(matches!(
+            state.terminal_completion(true),
+            Some(ManagerCompletion::Graceful)
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_denied_session_lease_cannot_leave_a_due_deadline_behind() {
+        // `reconcile_recoveries` leaves a due retry in place when it cannot take
+        // a session lease, and `manage` short-circuits on a due deadline without
+        // awaiting. Those two only stay safe together because a session lease is
+        // refused exactly while an exclusive operation is queued or active,
+        // which is when `deadline` reports nothing to wake for. Assert the
+        // coupling here, so a future lease rule that breaks it fails as a test
+        // rather than as a hot loop on a current-thread runtime.
+        let access = ReceiverAccess::default();
+        let mut requests = access.subscribe_requests();
+        let retry_at = Instant::now() + RETRY_DELAY;
+        let mut state = HostSwitchManagerState::new();
+        state.slots.push(HostSwitchSlot::Restarting {
+            link: link(2),
+            retry_at,
+        });
+
+        assert!(access.try_acquire_for_session().is_some());
+        assert_eq!(
+            state.deadline(*requests.borrow_and_update(), true),
+            Some(retry_at)
+        );
+
+        let _exclusive = access
+            .acquire_exclusive(ExclusiveAccessReason::HostTransition)
+            .await;
+        assert!(access.try_acquire_for_session().is_none());
+        assert_eq!(state.deadline(*requests.borrow_and_update(), true), None);
     }
 
     #[tokio::test(start_paused = true)]

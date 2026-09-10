@@ -96,39 +96,74 @@ fn rebound_to(sample: Sample, edge: Edge, config: &FlowConfig) -> (i32, i32) {
     }
 }
 
+/// A dwell that completed and is now owed to the host-switch manager.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct EdgeSwitch {
+    edge: Edge,
+    host: u8,
+}
+
+/// Where the pointer stands relative to the edges that lead somewhere.
+#[derive(Debug, Clone, Copy, Default)]
+enum EdgeState {
+    /// Not touching a live edge.
+    #[default]
+    Idle,
+    /// Holding one edge since the recorded instant.
+    Holding {
+        edge: Edge,
+        since: Instant,
+    },
+    /// A switch was handed over and has not been reported settled yet.
+    Switching,
+    /// Settling after a switch; contacts are ignored until the instant passes.
+    Cooling {
+        until: Instant,
+    },
+}
+
 /// Sans-I/O dwell and cooldown state machine.
+///
+/// The cooldown is armed by [`Self::settled`], not by the observation that
+/// produced the switch. Arming it at the ask would make the dead time a
+/// property of how fast the watcher polls rather than of how long the hardware
+/// takes, and a transition that outlasts the cooldown would then have a second
+/// one queued behind it.
 #[derive(Debug, Default)]
 struct EdgeTracker {
-    contact: Option<(Edge, Instant)>,
-    cooldown_until: Option<Instant>,
+    state: EdgeState,
 }
 
 impl EdgeTracker {
-    /// Feed one observation; yields the edge and host once the dwell completes.
+    /// Feed one observation; yields the switch owed once the dwell completes.
+    ///
+    /// The caller must report the returned switch back through
+    /// [`Self::settled`]; until it does, further observations are inert.
     fn observe(
         &mut self,
         now: Instant,
         at: Option<Edge>,
         config: &FlowConfig,
-    ) -> Option<(Edge, u8)> {
-        if self.cooldown_until.is_some_and(|until| now < until) {
-            // Still settling from the last switch. Clearing the contact means a
-            // pointer parked on the edge owes a full fresh dwell afterwards,
-            // rather than firing again the instant the cooldown lapses.
-            self.contact = None;
-            return None;
+    ) -> Option<EdgeSwitch> {
+        match self.state {
+            // The caller still owes a `settled`, so it is mid-transition.
+            EdgeState::Switching => return None,
+            EdgeState::Cooling { until } if now < until => return None,
+            EdgeState::Idle | EdgeState::Holding { .. } | EdgeState::Cooling { .. } => {}
         }
-        self.cooldown_until = None;
 
         let Some(edge) = at else {
             // Leaving the edge forfeits the dwell; a later contact starts over.
-            self.contact = None;
+            self.state = EdgeState::Idle;
             return None;
         };
-        let since = match self.contact {
-            Some((held, since)) if held == edge => since,
+        // Anything but an unbroken hold of this same edge starts a fresh dwell,
+        // so a pointer parked through a cooldown owes the full dwell again
+        // rather than firing the instant the cooldown lapses.
+        let since = match self.state {
+            EdgeState::Holding { edge: held, since } if held == edge => since,
             _ => {
-                self.contact = Some((edge, now));
+                self.state = EdgeState::Holding { edge, since: now };
                 now
             }
         };
@@ -136,14 +171,25 @@ impl EdgeTracker {
             return None;
         }
         let host = config.edges.host_for(edge)?;
-        self.contact = None;
-        self.cooldown_until = Some(now + Duration::from_millis(u64::from(config.cooldown_ms)));
-        Some((edge, host))
+        self.state = EdgeState::Switching;
+        Some(EdgeSwitch { edge, host })
+    }
+
+    /// Report that the switch handed out by [`Self::observe`] has finished, and
+    /// start the cooldown from that moment.
+    fn settled(&mut self, now: Instant, config: &FlowConfig) {
+        self.state = EdgeState::Cooling {
+            until: now + Duration::from_millis(u64::from(config.cooldown_ms)),
+        };
     }
 
     /// Forget any partial dwell, e.g. after the config changed underneath.
+    ///
+    /// A cooldown is not a dwell and survives: the devices really did move.
     fn reset(&mut self) {
-        self.contact = None;
+        if matches!(self.state, EdgeState::Holding { .. }) {
+            self.state = EdgeState::Idle;
+        }
     }
 }
 
@@ -204,14 +250,23 @@ async fn watch_edges(flow: &mut FlowSettings, requester: &HostSwitchRequester) {
         match active.sample() {
             Ok(sample) => {
                 let now = Instant::now();
-                if let Some((edge, host)) = tracker.observe(now, edge_at(sample, &config), &config)
-                {
-                    let (x, y) = rebound_to(sample, edge, &config);
+                if let Some(switch) = tracker.observe(now, edge_at(sample, &config), &config) {
+                    let (x, y) = rebound_to(sample, switch.edge, &config);
                     if let Err(error) = active.warp(x, y) {
                         debug!(%error, "flow: could not pull the pointer back");
                     }
-                    debug!(?edge, host, "flow: edge reached — requesting host switch");
-                    requester.request(host);
+                    debug!(
+                        edge = ?switch.edge,
+                        host = switch.host,
+                        "flow: edge reached — requesting host switch"
+                    );
+                    // Park here for the whole transition. The manager coalesces
+                    // asks, but a watcher that kept polling would still be
+                    // asking on every frame the pointer stays on the edge; the
+                    // one thing that keeps this loop from outrunning the
+                    // hardware is that it cannot ask again until this returns.
+                    requester.request(switch.host).await;
+                    tracker.settled(Instant::now(), &config);
                 }
             }
             Err(error) => {
@@ -231,7 +286,11 @@ mod tests {
 
     use openlogi_core::config::{Edge, FlowConfig, FlowEdges};
 
-    use super::{Bounds, EdgeTracker, Sample, edge_at, rebound_to};
+    use super::{Bounds, EdgeSwitch, EdgeTracker, Sample, edge_at, rebound_to};
+
+    fn switch(edge: Edge, host: u8) -> Option<EdgeSwitch> {
+        Some(EdgeSwitch { edge, host })
+    }
 
     const BOUNDS: Bounds = Bounds {
         min_x: 0,
@@ -292,7 +351,7 @@ mod tests {
                 Some(Edge::Right),
                 &config
             ),
-            Some((Edge::Right, 3))
+            switch(Edge::Right, 3)
         );
     }
 
@@ -329,7 +388,7 @@ mod tests {
                 Some(Edge::Right),
                 &config
             ),
-            Some((Edge::Right, 3))
+            switch(Edge::Right, 3)
         );
     }
 
@@ -358,12 +417,12 @@ mod tests {
                 Some(Edge::Left),
                 &config
             ),
-            Some((Edge::Left, 1))
+            switch(Edge::Left, 1)
         );
     }
 
     #[test]
-    fn cooldown_suppresses_a_held_edge() {
+    fn a_held_edge_cannot_fire_again_until_the_switch_is_reported_settled() {
         let config = config();
         let mut tracker = EdgeTracker::default();
         let start = Instant::now();
@@ -374,13 +433,58 @@ mod tests {
                 Some(Edge::Right),
                 &config
             ),
-            Some((Edge::Right, 3))
+            switch(Edge::Right, 3)
         );
-        // Holding against the edge through the cooldown must not fire again.
-        // The switch landed at 100ms, so the cooldown runs to 1100ms.
+        // The transition is still running. However long it takes — the manager
+        // budgets ten seconds for the device to leave — a pointer parked on the
+        // edge must not accumulate a second move behind the first.
+        for elapsed in [200, 1_000, 5_000, 30_000] {
+            assert_eq!(
+                tracker.observe(
+                    start + Duration::from_millis(elapsed),
+                    Some(Edge::Right),
+                    &config
+                ),
+                None,
+                "an unsettled switch must swallow every later contact",
+            );
+        }
+        // Leaving and returning does not get around it either.
+        assert_eq!(
+            tracker.observe(start + Duration::from_millis(30_100), None, &config),
+            None
+        );
         assert_eq!(
             tracker.observe(
-                start + Duration::from_millis(600),
+                start + Duration::from_millis(30_200),
+                Some(Edge::Right),
+                &config
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn the_cooldown_runs_from_the_settlement_not_from_the_ask() {
+        let config = config();
+        let mut tracker = EdgeTracker::default();
+        let start = Instant::now();
+        tracker.observe(start, Some(Edge::Right), &config);
+        assert_eq!(
+            tracker.observe(
+                start + Duration::from_millis(100),
+                Some(Edge::Right),
+                &config
+            ),
+            switch(Edge::Right, 3)
+        );
+
+        // The transition took 4s; the 1s cooldown therefore runs to 5100ms, not
+        // to 1100ms as it would if the ask had armed it.
+        tracker.settled(start + Duration::from_millis(4_100), &config);
+        assert_eq!(
+            tracker.observe(
+                start + Duration::from_millis(4_500),
                 Some(Edge::Right),
                 &config
             ),
@@ -388,7 +492,7 @@ mod tests {
         );
         assert_eq!(
             tracker.observe(
-                start + Duration::from_millis(1_050),
+                start + Duration::from_millis(5_050),
                 Some(Edge::Right),
                 &config
             ),
@@ -398,7 +502,7 @@ mod tests {
         // so this contact only re-arms the timer.
         assert_eq!(
             tracker.observe(
-                start + Duration::from_millis(1_200),
+                start + Duration::from_millis(5_200),
                 Some(Edge::Right),
                 &config
             ),
@@ -406,11 +510,43 @@ mod tests {
         );
         assert_eq!(
             tracker.observe(
-                start + Duration::from_millis(1_310),
+                start + Duration::from_millis(5_310),
                 Some(Edge::Right),
                 &config
             ),
-            Some((Edge::Right, 3))
+            switch(Edge::Right, 3)
+        );
+    }
+
+    #[test]
+    fn a_reset_forfeits_a_partial_dwell_but_not_a_cooldown() {
+        let config = config();
+        let mut tracker = EdgeTracker::default();
+        let start = Instant::now();
+
+        tracker.observe(start, Some(Edge::Right), &config);
+        tracker.reset();
+        assert_eq!(
+            tracker.observe(
+                start + Duration::from_millis(110),
+                Some(Edge::Right),
+                &config
+            ),
+            None,
+            "a forfeited dwell must start over",
+        );
+
+        let mut cooling = EdgeTracker::default();
+        cooling.settled(start, &config);
+        cooling.reset();
+        assert_eq!(
+            cooling.observe(
+                start + Duration::from_millis(500),
+                Some(Edge::Right),
+                &config
+            ),
+            None,
+            "the devices really did move, so the settle time still holds",
         );
     }
 
