@@ -37,7 +37,7 @@ struct HostSwitchManagerContext {
     receiver_access: ReceiverAccess,
     receiver_requests: watch::Receiver<ReceiverRequestState>,
     device_io: DeviceIoGate,
-    external_requests: mpsc::UnboundedReceiver<u8>,
+    external_requests: mpsc::Receiver<u8>,
     shutdown: oneshot::Receiver<()>,
 }
 
@@ -46,15 +46,21 @@ struct HostSwitchManagerContext {
 /// The manager stays the single transition authority: a caller that switched
 /// hosts on its own would race the capture sessions this module owns.
 #[derive(Clone, Debug)]
-pub struct HostSwitchRequester(mpsc::UnboundedSender<u8>);
+pub struct HostSwitchRequester(mpsc::Sender<u8>);
 
 impl HostSwitchRequester {
     /// Request a move to `host`, the 0-based index `CHANGE_HOST` addresses.
     ///
-    /// Dropped silently once the manager has shut down; a failed request is
-    /// indistinguishable from an unpaired slot to the caller either way.
+    /// Never blocks and never queues past one pending request. A transition
+    /// takes seconds while callers are timer-driven, so buffering here would
+    /// only let a backlog outlive the intent that produced it.
     pub fn request(&self, host: u8) {
-        let _ = self.0.send(host);
+        if self.0.try_send(host).is_err() {
+            debug!(
+                host,
+                "host switch request dropped — one is already queued or the manager is gone"
+            );
+        }
     }
 }
 
@@ -74,7 +80,7 @@ pub fn spawn(
     let receiver_requests = receiver_access.subscribe_requests();
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
     let (shutdown_done_tx, shutdown_done_rx) = oneshot::channel();
-    let (requests_tx, requests_rx) = mpsc::unbounded_channel();
+    let (requests_tx, requests_rx) = mpsc::channel(1);
     thread::spawn(move || {
         let runtime = match tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -253,7 +259,10 @@ impl HostSwitchManagerState {
     /// request is simply dropped while another is in flight.
     fn request_transition(&mut self, published: &[HostSwitchLink], host: u8) {
         if self.transition.is_some() {
-            debug!(host, "host switch request ignored — a transition is in flight");
+            debug!(
+                host,
+                "host switch request ignored — a transition is in flight"
+            );
             return;
         }
         let Some(link) = published.first().cloned() else {
