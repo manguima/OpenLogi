@@ -106,6 +106,9 @@ right = 3
 Edges are matched against the whole desktop's outer bounds, not the current
 monitor, so a multi-monitor setup only ever triggers at the far left and right.
 An edge left unset never switches. The section is absent and inert by default.
+Channels count from 1 like the numbers on the device, so a device with three
+host slots accepts `1`, `2`, and `3`; `0` is not a channel and is rejected when
+the file is read.
 
 The pointer stays on this machine — nothing moves it to the far edge of the
 next host's screen, and there is no clipboard transfer. Every host you switch

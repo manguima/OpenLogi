@@ -43,7 +43,9 @@ pub type HostSwitchLinks = watch::Receiver<std::sync::Arc<Vec<HostSwitchLink>>>;
 struct HostRequest {
     /// Monotonic id. Also what a caller waits to see settled.
     serial: u64,
-    /// 1-based Easy-Switch channel.
+    /// 0-based host index, the convention the HID++ host features use. A
+    /// caller holding a 1-based Easy-Switch channel converts it first; see
+    /// [`openlogi_core::config::EasySwitchChannel::host_index`].
     host: u8,
 }
 
@@ -73,8 +75,13 @@ impl std::fmt::Debug for HostSwitchRequester {
 }
 
 impl HostSwitchRequester {
-    /// Request a move to the 1-based Easy-Switch channel `host`, resolving once
-    /// the manager has finished acting on it.
+    /// Request a move to the 0-based host index `host`, resolving once the
+    /// manager has finished acting on it.
+    ///
+    /// Zero-based because that is what the HID++ host features and the
+    /// Easy-Switch key-press path both speak. A caller reading the 1-based
+    /// channel out of `[flow.edges]` converts with
+    /// [`openlogi_core::config::EasySwitchChannel::host_index`] before asking.
     ///
     /// Settled means carried out, superseded by a later ask, throttled after
     /// repeated failures, or abandoned because the manager shut down. A caller

@@ -9,7 +9,7 @@ use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use openlogi_core::config::{Edge, FlowConfig};
+use openlogi_core::config::{EasySwitchChannel, Edge, FlowConfig};
 use tokio::sync::watch;
 use tracing::{debug, warn};
 
@@ -108,7 +108,9 @@ fn rebound_to(sample: Sample, edge: Edge, config: &FlowConfig) -> (i32, i32) {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct EdgeSwitch {
     edge: Edge,
-    host: u8,
+    /// As configured: the 1-based channel printed on the device. It becomes a
+    /// 0-based host index only where it crosses into the host-switch manager.
+    channel: EasySwitchChannel,
 }
 
 /// Where the pointer stands relative to the edges that lead somewhere.
@@ -173,9 +175,9 @@ impl EdgeTracker {
         if now.duration_since(since) < Duration::from_millis(u64::from(config.dwell_ms)) {
             return None;
         }
-        let host = config.edges.host_for(edge)?;
+        let channel = config.edges.host_for(edge)?;
         self.state = EdgeState::Switching;
-        Some(EdgeSwitch { edge, host })
+        Some(EdgeSwitch { edge, channel })
     }
 
     /// Report that the switch handed out by [`Self::observe`] has finished, and
@@ -258,9 +260,14 @@ async fn watch_edges(flow: &mut FlowSettings, requester: &HostSwitchRequester) {
                     if let Err(error) = active.warp(x, y) {
                         debug!(%error, "flow: could not pull the pointer back");
                     }
+                    // The configured number is the one printed on the device
+                    // and counts from 1; every layer below this call counts
+                    // hosts from 0. This is the only crossing between the two.
+                    let host = switch.channel.host_index();
                     debug!(
                         edge = ?switch.edge,
-                        host = switch.host,
+                        channel = switch.channel.get(),
+                        host,
                         "flow: edge reached — requesting host switch"
                     );
                     // Park here for the whole transition. The manager coalesces
@@ -268,7 +275,7 @@ async fn watch_edges(flow: &mut FlowSettings, requester: &HostSwitchRequester) {
                     // asking on every frame the pointer stays on the edge; the
                     // one thing that keeps this loop from outrunning the
                     // hardware is that it cannot ask again until this returns.
-                    requester.request(switch.host).await;
+                    requester.request(host).await;
                     tracker.settled(Instant::now(), &config);
                 }
             }
@@ -287,12 +294,19 @@ async fn watch_edges(flow: &mut FlowSettings, requester: &HostSwitchRequester) {
 mod tests {
     use std::time::{Duration, Instant};
 
-    use openlogi_core::config::{Edge, FlowConfig, FlowEdges};
+    use openlogi_core::config::{EasySwitchChannel, Edge, FlowConfig, FlowEdges};
 
     use super::{Bounds, EdgeSwitch, EdgeTracker, Sample, edge_at, rebound_to};
 
-    fn switch(edge: Edge, host: u8) -> Option<EdgeSwitch> {
-        Some(EdgeSwitch { edge, host })
+    fn channel(number: u8) -> EasySwitchChannel {
+        EasySwitchChannel::try_new(number).expect("test channels are non-zero")
+    }
+
+    fn switch(edge: Edge, configured: u8) -> Option<EdgeSwitch> {
+        Some(EdgeSwitch {
+            edge,
+            channel: channel(configured),
+        })
     }
 
     const BOUNDS: Bounds = Bounds {
@@ -306,8 +320,8 @@ mod tests {
         FlowConfig {
             enabled: true,
             edges: FlowEdges {
-                left: Some(1),
-                right: Some(3),
+                left: Some(channel(1)),
+                right: Some(channel(3)),
                 ..FlowEdges::default()
             },
             dwell_ms: 100,
@@ -356,6 +370,21 @@ mod tests {
             ),
             switch(Edge::Right, 3)
         );
+    }
+
+    #[test]
+    fn the_configured_channel_reaches_the_manager_as_a_zero_based_host() {
+        let config = config();
+        let mut tracker = EdgeTracker::default();
+        let start = Instant::now();
+        tracker.observe(start, Some(Edge::Right), &config);
+        let owed = tracker
+            .observe(start + Duration::from_millis(120), Some(Edge::Right), &config)
+            .expect("the dwell has elapsed");
+        // `right = 3` is the number printed on the device. Handing that straight
+        // to the host-switch manager would land the devices on channel 4.
+        assert_eq!(owed.channel.get(), 3);
+        assert_eq!(owed.channel.host_index(), 2);
     }
 
     #[test]
