@@ -315,7 +315,10 @@ impl RequestBackoff {
             return;
         }
         self.failures = self.failures.saturating_add(1);
-        let doublings = self.failures.saturating_sub(1).min(REQUEST_BACKOFF_DOUBLINGS);
+        let doublings = self
+            .failures
+            .saturating_sub(1)
+            .min(REQUEST_BACKOFF_DOUBLINGS);
         let delay = REQUEST_BACKOFF_BASE
             .saturating_mul(2u32.saturating_pow(doublings))
             .min(REQUEST_BACKOFF_MAX);
@@ -1302,7 +1305,10 @@ mod tests {
             .begin_transition(false)
             .expect("the second link should move");
         assert_eq!(second.host, 3);
-        assert_eq!(state.settled, 0, "the ask is not settled while work remains");
+        assert_eq!(
+            state.settled, 0,
+            "the ask is not settled while work remains"
+        );
 
         handle_manager_event(
             &mut state,
@@ -1327,7 +1333,10 @@ mod tests {
         state.accept_request(ask, &[link(2)], now);
         state.promote_request(&[link(2)], false, now);
         assert_eq!(
-            state.begin_transition(false).expect("the ask should run").host,
+            state
+                .begin_transition(false)
+                .expect("the ask should run")
+                .host,
             2
         );
 
@@ -1356,7 +1365,10 @@ mod tests {
         ));
 
         state.accept_request(HostRequest { serial: 2, host: 3 }, &[link(2)], now);
-        assert_eq!(state.settled, 1, "the superseded ask must release its caller");
+        assert_eq!(
+            state.settled, 1,
+            "the superseded ask must release its caller"
+        );
         assert!(
             state.transition.is_none(),
             "a queued intent for a superseded ask is a stale host move",
@@ -1388,7 +1400,10 @@ mod tests {
         state.record_transition_outcome(stale, TransitionOutcome::Failed);
 
         assert!(
-            state.request.as_ref().is_some_and(|request| !request.failed),
+            state
+                .request
+                .as_ref()
+                .is_some_and(|request| !request.failed),
             "the successor owns the slot and must not inherit the verdict",
         );
     }
@@ -1416,7 +1431,10 @@ mod tests {
             state.request.is_none(),
             "a throttled ask must not cost another exclusive lease",
         );
-        assert_eq!(state.settled, 2, "a throttled ask still releases its caller");
+        assert_eq!(
+            state.settled, 2,
+            "a throttled ask still releases its caller"
+        );
         state.promote_request(&[link(2)], false, now);
         assert!(state.transition.is_none());
 
@@ -1433,7 +1451,10 @@ mod tests {
         backoff.record(2, true, now);
         assert!(backoff.blocks(2, now + REQUEST_BACKOFF_BASE - Duration::from_millis(1)));
         assert!(!backoff.blocks(2, now + REQUEST_BACKOFF_BASE));
-        assert!(!backoff.blocks(3, now), "only the refusing host is throttled");
+        assert!(
+            !backoff.blocks(3, now),
+            "only the refusing host is throttled"
+        );
 
         backoff.record(2, true, now);
         assert!(backoff.blocks(2, now + REQUEST_BACKOFF_BASE));

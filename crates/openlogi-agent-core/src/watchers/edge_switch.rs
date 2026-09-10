@@ -110,16 +110,11 @@ enum EdgeState {
     #[default]
     Idle,
     /// Holding one edge since the recorded instant.
-    Holding {
-        edge: Edge,
-        since: Instant,
-    },
+    Holding { edge: Edge, since: Instant },
     /// A switch was handed over and has not been reported settled yet.
     Switching,
     /// Settling after a switch; contacts are ignored until the instant passes.
-    Cooling {
-        until: Instant,
-    },
+    Cooling { until: Instant },
 }
 
 /// Sans-I/O dwell and cooldown state machine.
