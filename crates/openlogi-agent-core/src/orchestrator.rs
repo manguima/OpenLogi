@@ -115,6 +115,10 @@ pub struct SharedRuntime {
     pub host_switch_links: HostSwitchLinks,
     /// Live `[flow]` section driving the pointer-edge watcher.
     pub flow: crate::watchers::edge_switch::FlowSettings,
+    /// This host's own Easy-Switch slot, once something has read it from the
+    /// device. `None` until then, which the peer listener treats as "accept
+    /// on the strength of the address the peer connected to".
+    pub flow_slot: crate::flow::listen::OwnSlot,
 }
 
 impl SharedRuntime {
@@ -195,6 +199,9 @@ pub struct Orchestrator {
     keyboard_spec_tx: watch::Sender<Option<Arc<KeyboardSpec>>>,
     host_switch_links_tx: watch::Sender<Arc<Vec<HostSwitchLink>>>,
     flow_tx: watch::Sender<Arc<FlowConfig>>,
+    /// Producer half of [`SharedRuntime::flow_slot`]. Held so the receiver
+    /// stays open; the host-table read that fills it is not wired yet.
+    _flow_slot_tx: watch::Sender<Option<u8>>,
     shared: SharedRuntime,
     /// The state the GUI observes. Every mutator below that changes one of its
     /// facts republishes here, so the cell cannot go stale behind a new code
@@ -241,6 +248,7 @@ impl Orchestrator {
         let (keyboard_spec_tx, keyboard_spec) = watch::channel(None);
         let (host_switch_links_tx, host_switch_links) = watch::channel(Arc::new(Vec::new()));
         let (flow_tx, flow) = watch::channel(Arc::new(config.flow.clone()));
+        let (flow_slot_tx, flow_slot) = watch::channel(None);
         let shared = SharedRuntime {
             device_io: hardware.device_io(),
             channel_pool: hardware.channel_pool(),
@@ -261,6 +269,7 @@ impl Orchestrator {
             receiver_access: ReceiverAccess::default(),
             host_switch_links,
             flow,
+            flow_slot,
         };
         let orch = Self {
             config,
@@ -278,6 +287,7 @@ impl Orchestrator {
             keyboard_spec_tx,
             host_switch_links_tx,
             flow_tx,
+            _flow_slot_tx: flow_slot_tx,
             shared,
             observable,
         };

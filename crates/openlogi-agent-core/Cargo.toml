@@ -19,7 +19,7 @@ openlogi-ipc = { path = "../openlogi-ipc" }
 futures-lite = { workspace = true }
 serde = { workspace = true }
 thiserror = { workspace = true }
-tokio = { workspace = true }
+tokio = { workspace = true, features = ["net", "io-util"] }
 tracing = { workspace = true }
 hmac = "0.12"
 sha2 = "0.10"

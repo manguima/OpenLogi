@@ -216,6 +216,7 @@ pub(crate) fn spawn_hidpp_watchers(
         shared.device_io.clone(),
     );
     watchers::edge_switch::spawn(&shared.flow, host_switch_requester);
+    openlogi_agent_core::flow::listen::spawn(&shared.flow, shared.flow_slot.clone());
     let keyboard = watchers::keyboard::spawn(
         &shared.keyboard_spec,
         shared.keyboard_channel.clone(),
