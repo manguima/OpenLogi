@@ -200,6 +200,9 @@ struct TransitionIntent {
     link: HostSwitchLink,
     host: u8,
     source: TransitionSource,
+    /// When the ask was accepted, so each stage can report how much of the
+    /// user-visible delay it owns.
+    accepted_at: Instant,
 }
 
 enum TransitionPhase {
@@ -347,12 +350,17 @@ impl HostSwitchManagerState {
             return;
         }
         let Some(link) = published.first().cloned() else {
+            debug!(
+                host,
+                "host switch request dropped — no configured link is online"
+            );
             return;
         };
         self.transition = Some(TransitionPhase::Waiting(TransitionIntent {
             link,
             host,
             source: TransitionSource::Request,
+            accepted_at: now,
         }));
     }
 
@@ -543,6 +551,7 @@ impl HostSwitchManagerState {
                 link: session.link,
                 host,
                 source: TransitionSource::KeyPress,
+                accepted_at: Instant::now(),
             }));
         } else if result.failed && request_is_current {
             self.slots.push(HostSwitchSlot::Restarting {
@@ -581,6 +590,7 @@ impl HostSwitchManagerState {
                         link: recovery.link,
                         host,
                         source: TransitionSource::KeyPress,
+                        accepted_at: Instant::now(),
                     }));
                 }
             }
@@ -652,6 +662,7 @@ async fn manage(context: HostSwitchManagerContext) -> ManagerCompletion {
             }
             Some(host) = external_requests.recv(), if !terminal => {
                 let published = links.borrow().clone();
+                debug!(host, links = published.len(), "host switch request received");
                 state.request_transition(&published, host, Instant::now());
             }
             Some(event) = event_rx.recv() => {
@@ -796,13 +807,18 @@ async fn run_transition(
     device_io: DeviceIoGate,
     intent: TransitionIntent,
 ) -> TransitionOutcome {
+    // Three stages sit between the ask and the device moving, and only
+    // measurement says which one owns the delay a user feels.
+    let drained_ms = intent.accepted_at.elapsed().as_millis();
     let _lease = receiver_access
         .acquire_exclusive(ExclusiveAccessReason::HostTransition)
         .await;
+    let leased_ms = intent.accepted_at.elapsed().as_millis();
     if !device_io.allows_io() || !links.borrow().contains(&intent.link) {
         return TransitionOutcome::Settled;
     }
-    match switch_linked_hosts(
+    let write_started = Instant::now();
+    let outcome = match switch_linked_hosts(
         &intent.link.keyboard,
         &intent.link.targets,
         intent.host,
@@ -823,7 +839,16 @@ async fn run_transition(
             debug!(%error, route = %intent.link.keyboard, host = intent.host, "keyboard host switch failed");
             TransitionOutcome::Failed
         }
-    }
+    };
+    debug!(
+        host = intent.host,
+        drained_ms,
+        leased_ms,
+        wrote_ms = write_started.elapsed().as_millis(),
+        total_ms = intent.accepted_at.elapsed().as_millis(),
+        "host transition timing"
+    );
+    outcome
 }
 
 fn expedite_pending_restores(state: &mut HostSwitchManagerState) {
@@ -919,6 +944,7 @@ mod tests {
             link: link(2),
             host: 1,
             source: TransitionSource::KeyPress,
+            accepted_at: Instant::now(),
         }));
 
         state.reconcile_transition(&[link(3)], false);
@@ -992,6 +1018,7 @@ mod tests {
             link: link(2),
             host: 2,
             source: TransitionSource::KeyPress,
+            accepted_at: Instant::now(),
         }));
         assert!(state.begin_transition(false).is_none());
         assert!(matches!(
@@ -1152,6 +1179,7 @@ mod tests {
             link: link(2),
             host: 1,
             source: TransitionSource::KeyPress,
+            accepted_at: Instant::now(),
         }));
 
         assert!(state.begin_transition(false).is_some());
