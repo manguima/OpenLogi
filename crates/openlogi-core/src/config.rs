@@ -29,7 +29,7 @@ pub use device::{DeviceConfig, DeviceIdentity, LinkConfig, LinkOverrides};
 pub use file::{ConfigError, ConfigFile};
 #[cfg(all(test, feature = "fs"))]
 use file::{backup_existing_config, config_backup_path};
-pub use flow::{Edge, FlowConfig, FlowEdges, HostChannel};
+pub use flow::{DEFAULT_PEER_PORT, Edge, FlowConfig, FlowEdges, HostChannel, PeerConfig};
 pub use identity::canonical_device_key;
 pub use key_trigger::{KeyModifiers, KeyTrigger, KeyboardConfig, ParseTriggerError};
 pub use settings::LightSettings;

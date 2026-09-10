@@ -103,13 +103,35 @@ left = 1            # 1-based Easy-Switch channels, as printed on the devices
 right = 3
 ```
 
+`[flow.peers]` adds the peer link that makes a switch look instant. Switching
+the devices costs a radio reconnect that nothing in software can shorten; what
+a peer buys is cover — the arriving host places its own pointer where the
+pointer left, over the LAN, while the radio catches up.
+
+```toml
+[flow.peers]
+secret = "the same string on every host"
+port = 59870        # optional; 59870 by default
+
+# Only for hosts whose name the network will not resolve. The device already
+# stores what each host calls itself, so this is usually empty.
+[flow.peers.addresses]
+"DESKTOP-0B5NC53" = "192.168.1.20"
+```
+
+The secret is required: a handoff moves the pointer, so a service anyone on
+the network could drive is worse than no handoff. Every message is signed with
+it and carries a send time and a nonce, so a captured packet cannot be
+replayed. Without a secret the peer link stays off and the switch still works
+— the pointer simply does not appear on the arriving host until its own OS
+moves it.
+
 Edges are matched against the whole desktop's outer bounds, not the current
 monitor, so a multi-monitor setup only ever triggers at the far left and right.
 An edge left unset never switches. The section is absent and inert by default.
 
-The pointer stays on this machine — nothing moves it to the far edge of the
-next host's screen, and there is no clipboard transfer. Every host you switch
-from needs OpenLogi running with its own `[flow]` section. macOS reports the
+Every host you switch from needs OpenLogi running with its own `[flow]`
+section. There is no clipboard transfer. macOS reports the
 pointer backend as unavailable and logs it once; the feature is Linux (X11) and
 Windows for now.
 

@@ -126,3 +126,8 @@ poll_hz = 60
 [flow.edges]
 left = 1
 right = 3
+
+# The peer link that covers a switch's radio reconnect. Off without a secret.
+[flow.peers]
+secret = "the same string on every host"
+port = 59870

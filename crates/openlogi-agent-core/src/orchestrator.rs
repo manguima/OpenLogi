@@ -240,7 +240,7 @@ impl Orchestrator {
         let (capture_plans_tx, capture_plans) = watch::channel(Arc::new(Vec::new()));
         let (keyboard_spec_tx, keyboard_spec) = watch::channel(None);
         let (host_switch_links_tx, host_switch_links) = watch::channel(Arc::new(Vec::new()));
-        let (flow_tx, flow) = watch::channel(Arc::new(config.flow));
+        let (flow_tx, flow) = watch::channel(Arc::new(config.flow.clone()));
         let shared = SharedRuntime {
             device_io: hardware.device_io(),
             channel_pool: hardware.channel_pool(),
@@ -417,7 +417,7 @@ impl Orchestrator {
             &self.host_switch_links_tx,
             host_switch_links(&self.config, &self.devices),
         );
-        publish_arc_if_changed(&self.flow_tx, self.config.flow);
+        publish_arc_if_changed(&self.flow_tx, self.config.flow.clone());
         publish_optional_arc_if_changed(&self.keyboard_spec_tx, self.keyboard_spec_for());
     }
 
