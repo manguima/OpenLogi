@@ -7,7 +7,10 @@
 use serde::{Deserialize, Serialize};
 
 /// One edge of the desktop's bounding box.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+///
+/// Serializable because a peer handoff names the edge the pointer left
+/// through; the variant order is therefore part of that wire format.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum Edge {
     /// Minimum x.
     Left,
