@@ -707,6 +707,15 @@ fn snapshot_of(state: &State) -> AgentSnapshot {
               the real server impl, which is the point of the mock"
 )]
 impl Agent for MockAgent {
+    /// The mock serves no hardware, so it reports no host table.
+    async fn read_hosts(
+        self,
+        _: tarpc::context::Context,
+        _: DeviceRoute,
+    ) -> Result<Option<openlogi_core::hid::HostTable>, WriteError> {
+        Ok(None)
+    }
+
     async fn protocol_version(self, _: Context) -> u32 {
         PROTOCOL_VERSION
     }
