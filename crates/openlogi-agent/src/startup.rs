@@ -208,13 +208,14 @@ pub(crate) fn spawn_hidpp_watchers(
             shared.hook_maps.clone(),
         ),
     );
-    let host_switch = watchers::host_switch::spawn(
+    let (host_switch, host_switch_requests) = watchers::host_switch::spawn(
         &shared.host_switch_links,
         shared.channel_pool.clone(),
         shared.receiver_access.clone(),
         shared.channel_registry.clone(),
         shared.device_io.clone(),
     );
+    watchers::edge_switch::spawn(&shared.flow, host_switch_requests);
     let keyboard = watchers::keyboard::spawn(
         &shared.keyboard_spec,
         shared.keyboard_channel.clone(),

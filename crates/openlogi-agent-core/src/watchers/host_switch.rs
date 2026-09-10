@@ -30,6 +30,23 @@ pub struct HostSwitchLink {
 /// Read-only, lossless, coalescing view of resolved links.
 pub type HostSwitchLinks = watch::Receiver<std::sync::Arc<Vec<HostSwitchLink>>>;
 
+/// Asks the manager to move every configured link to a host.
+///
+/// The manager stays the single transition authority: a caller that switched
+/// hosts on its own would race the capture sessions this module owns.
+#[derive(Clone, Debug)]
+pub struct HostSwitchRequester(mpsc::UnboundedSender<u8>);
+
+impl HostSwitchRequester {
+    /// Request a move to the 1-based Easy-Switch channel `host`.
+    ///
+    /// Dropped silently once the manager has shut down; a failed request is
+    /// indistinguishable from an unpaired slot to the caller either way.
+    pub fn request(&self, host: u8) {
+        let _ = self.0.send(host);
+    }
+}
+
 struct HostSwitchManagerContext {
     links: HostSwitchLinks,
     channel_pool: ChannelPool,
@@ -37,10 +54,14 @@ struct HostSwitchManagerContext {
     receiver_access: ReceiverAccess,
     receiver_requests: watch::Receiver<ReceiverRequestState>,
     device_io: DeviceIoGate,
+    requests: mpsc::UnboundedReceiver<u8>,
     shutdown: oneshot::Receiver<()>,
 }
 
 /// Spawn the host switch session manager.
+///
+/// The returned requester is how anything other than an Easy-Switch key press
+/// asks for a transition; dropping it leaves key presses as the only trigger.
 #[must_use]
 pub fn spawn(
     links: &HostSwitchLinks,
@@ -48,9 +69,10 @@ pub fn spawn(
     receiver_access: ReceiverAccess,
     registry: ChannelRegistry,
     device_io: DeviceIoGate,
-) -> WatcherHandle {
+) -> (WatcherHandle, HostSwitchRequester) {
     let links = links.clone();
     let receiver_requests = receiver_access.subscribe_requests();
+    let (requests_tx, requests_rx) = mpsc::unbounded_channel();
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
     let (shutdown_done_tx, shutdown_done_rx) = oneshot::channel();
     thread::spawn(move || {
@@ -72,6 +94,7 @@ pub fn spawn(
             receiver_access,
             receiver_requests,
             device_io,
+            requests: requests_rx,
             shutdown: shutdown_rx,
         }));
         // A manager return can strand detached task supervisors. Destroy their
@@ -79,7 +102,10 @@ pub fn spawn(
         drop(runtime);
         let _ = shutdown_done_tx.send(completion);
     });
-    WatcherHandle::new(shutdown_tx, shutdown_done_rx)
+    (
+        WatcherHandle::new(shutdown_tx, shutdown_done_rx),
+        HostSwitchRequester(requests_tx),
+    )
 }
 
 enum SessionPhase {
@@ -178,10 +204,20 @@ struct SessionServices {
     events: mpsc::UnboundedSender<ManagerEvent>,
 }
 
+/// An outstanding request to move every link to one host.
+///
+/// Links move one at a time through the same transition slot an Easy-Switch
+/// press uses, so `remaining` is what is left of the ask, not a queue of asks.
+struct PendingRequest {
+    host: u8,
+    remaining: Vec<HostSwitchLink>,
+}
+
 struct HostSwitchManagerState {
     slots: Vec<HostSwitchSlot>,
     next_generation: u64,
     transition: Option<TransitionPhase>,
+    request: Option<PendingRequest>,
     task_failed: bool,
 }
 
@@ -191,8 +227,42 @@ impl HostSwitchManagerState {
             slots: Vec::new(),
             next_generation: 0,
             transition: None,
+            request: None,
             task_failed: false,
         }
+    }
+
+    /// Record an externally requested move, superseding any earlier one.
+    fn accept_request(&mut self, host: u8, published: &[HostSwitchLink]) {
+        self.request = Some(PendingRequest {
+            host,
+            remaining: published.to_vec(),
+        });
+    }
+
+    /// Hand the outstanding request's next still-published link to the
+    /// transition slot, so it travels the same path a key press does.
+    fn promote_request(&mut self, published: &[HostSwitchLink], terminal: bool) {
+        if terminal {
+            self.request = None;
+            return;
+        }
+        if self.transition.is_some() {
+            return;
+        }
+        let Some(request) = self.request.as_mut() else {
+            return;
+        };
+        while let Some(link) = request.remaining.pop() {
+            if published.contains(&link) {
+                self.transition = Some(TransitionPhase::Waiting(TransitionIntent {
+                    link,
+                    host: request.host,
+                }));
+                return;
+            }
+        }
+        self.request = None;
     }
 
     fn has_pending_restores(&self) -> bool {
@@ -444,6 +514,7 @@ async fn manage(context: HostSwitchManagerContext) -> ManagerCompletion {
         receiver_access,
         mut receiver_requests,
         mut device_io,
+        requests: mut external_requests,
         mut shutdown,
     } = context;
     let (events, mut event_rx) = mpsc::unbounded_channel();
@@ -463,6 +534,7 @@ async fn manage(context: HostSwitchManagerContext) -> ManagerCompletion {
         let published = std::sync::Arc::clone(&links.borrow_and_update());
         let io_allowed = device_io.allows_io();
         state.reconcile_transition(&published, terminal);
+        state.promote_request(&published, terminal);
         let wanted = if terminal || requests.any() || state.transition.is_some() {
             &[][..]
         } else {
@@ -496,6 +568,10 @@ async fn manage(context: HostSwitchManagerContext) -> ManagerCompletion {
             Some(event) = event_rx.recv() => {
                 let published = links.borrow().clone();
                 handle_manager_event(&mut state, event, &published, terminal);
+            }
+            Some(host) = external_requests.recv(), if !terminal => {
+                let published = links.borrow().clone();
+                state.accept_request(host, &published);
             }
             result = links.changed() => {
                 if result.is_err() {
