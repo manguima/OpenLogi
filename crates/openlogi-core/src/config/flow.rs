@@ -24,6 +24,35 @@ impl Edge {
     pub const ALL: [Self; 4] = [Self::Left, Self::Right, Self::Top, Self::Bottom];
 }
 
+/// A host as the user names it: the 1-based Easy-Switch channel printed on
+/// the device.
+///
+/// HID++ indexes hosts from zero. Keeping the two apart in the type system is
+/// what stops a config value reaching `CHANGE_HOST` unconverted — a mistake
+/// that reads as "nothing happened", because channel 1 lands on index 1.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HostChannel(u8);
+
+impl HostChannel {
+    /// Wrap a 1-based channel, rejecting the meaningless zero.
+    #[must_use]
+    pub fn new(channel: u8) -> Option<Self> {
+        (channel >= 1).then_some(Self(channel))
+    }
+
+    /// The 1-based channel, as printed on the device.
+    #[must_use]
+    pub fn channel(self) -> u8 {
+        self.0
+    }
+
+    /// The 0-based index HID++ `CHANGE_HOST` expects.
+    #[must_use]
+    pub fn index(self) -> u8 {
+        self.0 - 1
+    }
+}
+
 /// The host each edge leads to.
 ///
 /// Values are 1-based Easy-Switch channels, matching the numbers printed on the
@@ -48,14 +77,18 @@ pub struct FlowEdges {
 
 impl FlowEdges {
     /// The host configured for `edge`, if any.
+    ///
+    /// A zero in the file is treated as unset rather than as index 0: the
+    /// numbers here are the ones printed on the device, which start at one.
     #[must_use]
-    pub fn host_for(self, edge: Edge) -> Option<u8> {
-        match edge {
+    pub fn host_for(self, edge: Edge) -> Option<HostChannel> {
+        let channel = match edge {
             Edge::Left => self.left,
             Edge::Right => self.right,
             Edge::Top => self.top,
             Edge::Bottom => self.bottom,
-        }
+        };
+        channel.and_then(HostChannel::new)
     }
 
     /// Whether no edge leads anywhere.
@@ -131,7 +164,7 @@ impl FlowConfig {
 
 #[cfg(test)]
 mod tests {
-    use super::{Edge, FlowConfig, FlowEdges};
+    use super::{Edge, FlowConfig, FlowEdges, HostChannel};
 
     #[test]
     fn default_section_is_omitted_and_inert() {
@@ -157,10 +190,37 @@ mod tests {
             right: Some(3),
             ..FlowEdges::default()
         };
-        assert_eq!(edges.host_for(Edge::Left), Some(1));
-        assert_eq!(edges.host_for(Edge::Right), Some(3));
+        assert_eq!(
+            edges.host_for(Edge::Left).map(HostChannel::channel),
+            Some(1)
+        );
+        assert_eq!(
+            edges.host_for(Edge::Right).map(HostChannel::channel),
+            Some(3)
+        );
         assert_eq!(edges.host_for(Edge::Top), None);
         assert!(!edges.is_empty());
+    }
+
+    #[test]
+    fn channel_one_is_hidpp_index_zero() {
+        // The bug this type exists to prevent: channel 1 is the *first* host,
+        // which CHANGE_HOST addresses as 0.
+        let first = HostChannel::new(1).expect("1 is a valid channel");
+        assert_eq!(first.channel(), 1);
+        assert_eq!(first.index(), 0);
+        let third = HostChannel::new(3).expect("3 is a valid channel");
+        assert_eq!(third.index(), 2);
+    }
+
+    #[test]
+    fn zero_is_not_a_channel() {
+        assert_eq!(HostChannel::new(0), None);
+        let edges = FlowEdges {
+            left: Some(0),
+            ..FlowEdges::default()
+        };
+        assert_eq!(edges.host_for(Edge::Left), None);
     }
 
     #[test]
