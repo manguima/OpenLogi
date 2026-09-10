@@ -9,7 +9,7 @@ use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use openlogi_core::config::{Edge, FlowConfig};
+use openlogi_core::config::{Edge, FlowConfig, HostChannel};
 use tokio::sync::watch;
 use tracing::{debug, warn};
 
@@ -110,7 +110,7 @@ impl EdgeTracker {
         now: Instant,
         at: Option<Edge>,
         config: &FlowConfig,
-    ) -> Option<(Edge, u8)> {
+    ) -> Option<(Edge, HostChannel)> {
         if self.cooldown_until.is_some_and(|until| now < until) {
             // Still settling from the last switch. Clearing the contact means a
             // pointer parked on the edge owes a full fresh dwell afterwards,
@@ -210,8 +210,12 @@ async fn watch_edges(flow: &mut FlowSettings, requester: &HostSwitchRequester) {
                     if let Err(error) = active.warp(x, y) {
                         debug!(%error, "flow: could not pull the pointer back");
                     }
-                    debug!(?edge, host, "flow: edge reached — requesting host switch");
-                    requester.request(host);
+                    debug!(
+                        ?edge,
+                        channel = host.channel(),
+                        "flow: edge reached — requesting host switch"
+                    );
+                    requester.request(host.index());
                 }
             }
             Err(error) => {
@@ -231,7 +235,13 @@ mod tests {
 
     use openlogi_core::config::{Edge, FlowConfig, FlowEdges};
 
+    use openlogi_core::config::HostChannel;
+
     use super::{Bounds, EdgeTracker, Sample, edge_at, rebound_to};
+
+    fn channel(value: u8) -> HostChannel {
+        HostChannel::new(value).expect("test channels are 1-based and non-zero")
+    }
 
     const BOUNDS: Bounds = Bounds {
         min_x: 0,
@@ -292,7 +302,7 @@ mod tests {
                 Some(Edge::Right),
                 &config
             ),
-            Some((Edge::Right, 3))
+            Some((Edge::Right, channel(3)))
         );
     }
 
@@ -329,7 +339,7 @@ mod tests {
                 Some(Edge::Right),
                 &config
             ),
-            Some((Edge::Right, 3))
+            Some((Edge::Right, channel(3)))
         );
     }
 
@@ -358,7 +368,7 @@ mod tests {
                 Some(Edge::Left),
                 &config
             ),
-            Some((Edge::Left, 1))
+            Some((Edge::Left, channel(1)))
         );
     }
 
@@ -374,7 +384,7 @@ mod tests {
                 Some(Edge::Right),
                 &config
             ),
-            Some((Edge::Right, 3))
+            Some((Edge::Right, channel(3)))
         );
         // Holding against the edge through the cooldown must not fire again.
         // The switch landed at 100ms, so the cooldown runs to 1100ms.
@@ -410,7 +420,7 @@ mod tests {
                 Some(Edge::Right),
                 &config
             ),
-            Some((Edge::Right, 3))
+            Some((Edge::Right, channel(3)))
         );
     }
 
