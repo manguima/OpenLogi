@@ -113,3 +113,16 @@ dpi = 800
 [keyboard.bindings]
 f1 = "MissionControl"
 "shift+command+f5" = "ShowDesktop"
+
+# Pointer-edge host switching. Absent and inert by default; the edges name
+# 1-based Easy-Switch channels, matching the numbers printed on the devices.
+[flow]
+enabled = true
+dwell_ms = 120
+rebound_px = 8
+cooldown_ms = 1500
+poll_hz = 60
+
+[flow.edges]
+left = 1
+right = 3
