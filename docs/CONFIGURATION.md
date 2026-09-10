@@ -85,6 +85,34 @@ Common device fields are:
 `shift+command+f5`. Supported trigger modifiers are `shift`, `control`,
 `option`, and `command`; aliases such as `ctrl`, `alt`, and `cmd` are accepted.
 
+`[flow]` switches hosts from the pointer instead of the Easy-Switch keys: hold
+the pointer against a screen edge and the keyboard and every device in its
+`host_switch_targets` move to the host that edge leads to. It reuses the
+host-switch link, so a keyboard with no targets configured has nothing to move.
+
+```toml
+[flow]
+enabled = true
+dwell_ms = 120      # how long the pointer must hold against the edge
+rebound_px = 8      # how far it is pulled back afterwards
+cooldown_ms = 1500  # dead time covering the device reconnect
+poll_hz = 60
+
+[flow.edges]
+left = 1            # 1-based Easy-Switch channels, as printed on the devices
+right = 3
+```
+
+Edges are matched against the whole desktop's outer bounds, not the current
+monitor, so a multi-monitor setup only ever triggers at the far left and right.
+An edge left unset never switches. The section is absent and inert by default.
+
+The pointer stays on this machine — nothing moves it to the far edge of the
+next host's screen, and there is no clipboard transfer. Every host you switch
+from needs OpenLogi running with its own `[flow]` section. macOS reports the
+pointer backend as unavailable and logs it once; the feature is Linux (X11) and
+Windows for now.
+
 ## Actions
 
 Action names are the serialized Rust variant names, including `Copy`,
