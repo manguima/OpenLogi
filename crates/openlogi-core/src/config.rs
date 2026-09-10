@@ -13,6 +13,7 @@ use serde::{Deserialize, Serialize};
 mod device;
 #[cfg(feature = "fs")]
 mod file;
+mod flow;
 mod identity;
 mod key_trigger;
 mod settings;
@@ -28,6 +29,7 @@ pub use device::{DeviceConfig, DeviceIdentity, LinkConfig, LinkOverrides};
 pub use file::{ConfigError, ConfigFile};
 #[cfg(all(test, feature = "fs"))]
 use file::{backup_existing_config, config_backup_path};
+pub use flow::{Edge, FlowConfig, FlowEdges};
 pub use identity::canonical_device_key;
 pub use key_trigger::{KeyModifiers, KeyTrigger, KeyboardConfig, ParseTriggerError};
 pub use settings::LightSettings;
@@ -133,6 +135,10 @@ pub struct Config {
     /// `[keyboard]` section loading unchanged.
     #[serde(default)]
     pub keyboard: KeyboardConfig,
+    /// Pointer-edge host switching. Off unless a `[flow]` section turns it on,
+    /// so an upgrade never starts moving devices on its own.
+    #[serde(default, skip_serializing_if = "FlowConfig::is_default")]
+    pub flow: FlowConfig,
 }
 
 impl Default for Config {
@@ -144,6 +150,7 @@ impl Default for Config {
             devices: BTreeMap::new(),
             ephemeral: false,
             keyboard: KeyboardConfig::default(),
+            flow: FlowConfig::default(),
         }
     }
 }
