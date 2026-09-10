@@ -18,6 +18,7 @@ pub mod flow;
 pub mod hardware;
 pub mod observable;
 pub mod orchestrator;
+pub mod pointer;
 pub mod receiver_access;
 pub mod runtime;
 pub mod watchers;

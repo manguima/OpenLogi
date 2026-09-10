@@ -13,70 +13,11 @@ use openlogi_core::config::{Edge, FlowConfig, HostChannel};
 use tokio::sync::watch;
 use tracing::{debug, warn};
 
+use crate::pointer::{Pointer, Sample};
 use crate::watchers::host_switch::HostSwitchRequester;
-
-#[cfg(target_os = "linux")]
-mod linux;
-#[cfg(target_os = "macos")]
-mod macos;
-#[cfg(target_os = "windows")]
-mod windows;
-
-#[cfg(target_os = "linux")]
-use linux as platform;
-#[cfg(target_os = "macos")]
-use macos as platform;
-#[cfg(target_os = "windows")]
-use windows as platform;
 
 /// Read-only, coalescing view of the live `[flow]` section.
 pub type FlowSettings = watch::Receiver<Arc<FlowConfig>>;
-
-/// Inclusive bounding box of the desktop, in the OS's virtual-screen space.
-///
-/// The union of every monitor, so the edges tested are the outer edges of the
-/// whole desktop rather than of whichever monitor the pointer is on.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct Bounds {
-    pub(crate) min_x: i32,
-    pub(crate) min_y: i32,
-    pub(crate) max_x: i32,
-    pub(crate) max_y: i32,
-}
-
-/// One pointer observation.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct Sample {
-    pub(crate) x: i32,
-    pub(crate) y: i32,
-    pub(crate) bounds: Bounds,
-}
-
-/// Why the pointer could not be read or moved.
-#[derive(Debug, thiserror::Error)]
-pub(crate) enum PointerError {
-    /// No usable display server connection on this host.
-    // Win32's cursor APIs are session-global, so that backend has no connect
-    // step that can fail and never builds this variant.
-    #[cfg_attr(
-        target_os = "windows",
-        expect(clippy::allow_attributes, reason = "see above"),
-        allow(dead_code, reason = "constructed only by the X11 and macOS backends")
-    )]
-    #[error("no display server available: {0}")]
-    Unavailable(String),
-    /// The connection was established but a request failed.
-    // The macOS backend is a stub whose `connect` never succeeds, so `sample`
-    // and `warp` — the only operations that can fail a request — are
-    // unreachable there and that backend never builds this variant.
-    #[cfg_attr(
-        target_os = "macos",
-        expect(clippy::allow_attributes, reason = "see above"),
-        allow(dead_code, reason = "constructed only by the X11 and Win32 backends")
-    )]
-    #[error("pointer request failed: {0}")]
-    Request(String),
-}
 
 /// Which edge `sample` is touching, restricted to edges that lead somewhere.
 fn edge_at(sample: Sample, config: &FlowConfig) -> Option<Edge> {
@@ -194,7 +135,7 @@ async fn watch_edges(flow: &mut FlowSettings, requester: &HostSwitchRequester) {
         }
 
         if pointer.is_none() {
-            match platform::Pointer::connect() {
+            match Pointer::connect() {
                 Ok(connected) => pointer = Some(connected),
                 Err(error) => {
                     warn!(%error, "flow: pointer unavailable — edge switching is off");
@@ -245,7 +186,9 @@ mod tests {
 
     use openlogi_core::config::HostChannel;
 
-    use super::{Bounds, EdgeTracker, Sample, edge_at, rebound_to};
+    use crate::pointer::{Bounds, Sample};
+
+    use super::{EdgeTracker, edge_at, rebound_to};
 
     fn channel(value: u8) -> HostChannel {
         HostChannel::new(value).expect("test channels are 1-based and non-zero")
