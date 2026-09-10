@@ -11,6 +11,7 @@
 //! transport live in the children.
 
 pub mod seal;
+pub mod wire;
 
 use openlogi_core::config::Edge;
 use serde::{Deserialize, Serialize};
