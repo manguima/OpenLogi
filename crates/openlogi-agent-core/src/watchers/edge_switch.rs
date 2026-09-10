@@ -66,6 +66,14 @@ pub(crate) enum PointerError {
     #[error("no display server available: {0}")]
     Unavailable(String),
     /// The connection was established but a request failed.
+    // The macOS backend is a stub whose `connect` never succeeds, so `sample`
+    // and `warp` — the only operations that can fail a request — are
+    // unreachable there and that backend never builds this variant.
+    #[cfg_attr(
+        target_os = "macos",
+        expect(clippy::allow_attributes, reason = "see above"),
+        allow(dead_code, reason = "constructed only by the X11 and Win32 backends")
+    )]
     #[error("pointer request failed: {0}")]
     Request(String),
 }
