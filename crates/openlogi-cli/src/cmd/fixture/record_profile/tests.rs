@@ -8,8 +8,8 @@ use openlogi_core::binding::ActionRingSlot;
 use openlogi_core::config::Lighting;
 use openlogi_core::device::DeviceInventory;
 use openlogi_core::hid::{
-    BacklightMode, BacklightState, BacklightStatus, Dpi, DpiInfo, LightCommand, PasskeyMethod,
-    ReceiverSelector, ScrollWheelMode, SmartShiftStatus,
+    BacklightMode, BacklightState, BacklightStatus, Dpi, DpiInfo, HostTable, LightCommand,
+    PasskeyMethod, ReceiverSelector, ScrollWheelMode, SmartShiftStatus,
 };
 use openlogi_fixture::{
     CANONICAL_DEVICE_PROFILE_JSON, SyntheticIdentityKind, classify_synthetic_identity_bytes,
@@ -283,6 +283,16 @@ impl Agent for TestAgent {
             |settings| &settings.backlight,
             0x1982,
         )
+    }
+
+    /// A semantic profile carries no host table, so the double answers the way
+    /// a single-host device does instead of panicking on a harmless read.
+    async fn read_hosts(
+        self,
+        _: TarpcContext,
+        _route: DeviceRoute,
+    ) -> Result<Option<HostTable>, WriteError> {
+        Ok(None)
     }
 }
 
