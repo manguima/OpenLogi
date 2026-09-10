@@ -113,8 +113,8 @@ pointer left, over the LAN, while the radio catches up.
 secret = "the same string on every host"
 port = 59870        # optional; 59870 by default
 
-# Only for hosts whose name the network will not resolve. The device already
-# stores what each host calls itself, so this is usually empty.
+# Only for hosts neither `NAME` nor `NAME.local` resolves to. The device
+# already stores what each host calls itself, so this is usually empty.
 [flow.peers.addresses]
 "DESKTOP-0B5NC53" = "192.168.1.20"
 ```
