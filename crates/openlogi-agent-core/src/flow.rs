@@ -10,6 +10,7 @@
 //! This module is the pure half — the message and the geometry. Discovery and
 //! transport live in the children.
 
+pub mod listen;
 pub mod seal;
 pub mod wire;
 
@@ -110,13 +111,23 @@ pub struct Handoff {
 
 impl Handoff {
     /// Where the arriving host should place its pointer, given its own bounds.
+    ///
+    /// `inset` pulls the landing just inside the screen instead of onto the
+    /// boundary pixel. Landing exactly on the edge is what the local edge
+    /// watcher is watching for, so an arrival there reads as a departure and
+    /// the two hosts bounce the pointer back and forth forever.
     #[must_use]
-    pub fn landing(&self, min_x: i32, min_y: i32, max_x: i32, max_y: i32) -> (i32, i32) {
+    pub fn landing(&self, bounds: (i32, i32, i32, i32), inset: i32) -> (i32, i32) {
+        let (min_x, min_y, max_x, max_y) = bounds;
+        // Never inset past the middle: a desktop narrower than twice the inset
+        // would otherwise land the pointer on the far edge.
+        let across = inset.clamp(0, (max_x - min_x).max(0) / 2);
+        let down = inset.clamp(0, (max_y - min_y).max(0) / 2);
         match opposite(self.left_through) {
-            Edge::Left => (min_x, self.at.project(min_y, max_y)),
-            Edge::Right => (max_x, self.at.project(min_y, max_y)),
-            Edge::Top => (self.at.project(min_x, max_x), min_y),
-            Edge::Bottom => (self.at.project(min_x, max_x), max_y),
+            Edge::Left => (min_x + across, self.at.project(min_y, max_y)),
+            Edge::Right => (max_x - across, self.at.project(min_y, max_y)),
+            Edge::Top => (self.at.project(min_x, max_x), min_y + down),
+            Edge::Bottom => (self.at.project(min_x, max_x), max_y - down),
         }
     }
 }
@@ -184,13 +195,49 @@ mod tests {
 
     #[test]
     fn leaving_right_lands_on_the_left_edge_at_the_same_height() {
-        let landing = handoff(Edge::Right, 0.25).landing(0, 0, 2559, 1439);
+        let landing = handoff(Edge::Right, 0.25).landing((0, 0, 2559, 1439), 0);
         assert_eq!(landing, (0, 360));
     }
 
     #[test]
     fn leaving_the_top_lands_on_the_bottom_at_the_same_width() {
-        let landing = handoff(Edge::Top, 0.5).landing(0, 0, 1919, 1079);
+        let landing = handoff(Edge::Top, 0.5).landing((0, 0, 1919, 1079), 0);
         assert_eq!(landing, (960, 1079));
+    }
+
+    #[test]
+    fn an_inset_keeps_the_arrival_clear_of_the_local_edge() {
+        // Measured, not theorised: landing on the boundary pixel made the
+        // arriving host's own edge watcher fire and hand the pointer straight
+        // back, which is a ping-pong between the two machines.
+        assert_eq!(
+            handoff(Edge::Right, 0.25).landing((0, 0, 2559, 1439), 12),
+            (12, 360)
+        );
+        assert_eq!(
+            handoff(Edge::Left, 0.25).landing((0, 0, 2559, 1439), 12),
+            (2547, 360)
+        );
+        assert_eq!(
+            handoff(Edge::Top, 0.5).landing((0, 0, 1919, 1079), 12),
+            (960, 1067)
+        );
+        assert_eq!(
+            handoff(Edge::Bottom, 0.5).landing((0, 0, 1919, 1079), 12),
+            (960, 12)
+        );
+    }
+
+    #[test]
+    fn an_inset_never_overshoots_a_narrow_desktop() {
+        // A silly inset must not push the pointer out the far side.
+        let landing = handoff(Edge::Right, 0.5).landing((0, 0, 20, 20), 500);
+        assert_eq!(landing, (10, 10));
+    }
+
+    #[test]
+    fn a_negative_inset_is_treated_as_none() {
+        let landing = handoff(Edge::Right, 0.25).landing((0, 0, 2559, 1439), -50);
+        assert_eq!(landing, (0, 360));
     }
 }
