@@ -142,9 +142,14 @@ pub struct HostInfo {
 pub struct HostDescriptorPage {
     /// Host slot index returned by the device.
     pub host_index: HostIndex,
-    /// Descriptor bus type, decoded from the page header when known.
-    pub bus_type: HostBusType,
-    /// Descriptor page index, decoded from the page header.
+    /// The page header byte, unsplit.
+    ///
+    /// Its high bits were read as a bus type, which they are not: an MX
+    /// Keys / ERGO K860 over BLE answers `0x80` for every paired slot, and 8
+    /// is not a bus type. Only the low nibble is understood here, so the rest
+    /// is handed over raw rather than decoded into something it is not.
+    pub header: u8,
+    /// Descriptor page index, from the low nibble of the header.
     pub page_index: u8,
     /// Raw descriptor body bytes.
     pub body: [u8; 14],
@@ -204,8 +209,7 @@ impl HostsInfoFeature {
         body.copy_from_slice(&payload[2..16]);
         Ok(HostDescriptorPage {
             host_index: HostIndex::from(payload[0]),
-            bus_type: HostBusType::try_from(payload[1] >> 4)
-                .map_err(|_| Hidpp20Error::UnsupportedResponse)?,
+            header: payload[1],
             page_index: payload[1] & 0x0f,
             body,
         })
