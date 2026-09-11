@@ -85,6 +85,56 @@ Common device fields are:
 `shift+command+f5`. Supported trigger modifiers are `shift`, `control`,
 `option`, and `command`; aliases such as `ctrl`, `alt`, and `cmd` are accepted.
 
+`[flow]` switches hosts from the pointer instead of the Easy-Switch keys: hold
+the pointer against a screen edge and the keyboard and every device in its
+`host_switch_targets` move to the host that edge leads to. It reuses the
+host-switch link, so a keyboard with no targets configured has nothing to move.
+
+```toml
+[flow]
+enabled = true
+dwell_ms = 120      # how long the pointer must hold against the edge
+rebound_px = 8      # how far it is pulled back afterwards
+cooldown_ms = 1500  # dead time covering the device reconnect
+poll_hz = 60
+
+[flow.edges]
+left = 1            # 1-based Easy-Switch channels, as printed on the devices
+right = 3
+```
+
+`[flow.peers]` adds the peer link that makes a switch look instant. Switching
+the devices costs a radio reconnect that nothing in software can shorten; what
+a peer buys is cover — the arriving host places its own pointer where the
+pointer left, over the LAN, while the radio catches up.
+
+```toml
+[flow.peers]
+secret = "the same string on every host"
+port = 59870        # optional; 59870 by default
+
+# Only for hosts neither `NAME` nor `NAME.local` resolves to. The device
+# already stores what each host calls itself, so this is usually empty.
+[flow.peers.addresses]
+"DESKTOP-0B5NC53" = "192.168.1.20"
+```
+
+The secret is required: a handoff moves the pointer, so a service anyone on
+the network could drive is worse than no handoff. Every message is signed with
+it and carries a send time and a nonce, so a captured packet cannot be
+replayed. Without a secret the peer link stays off and the switch still works
+— the pointer simply does not appear on the arriving host until its own OS
+moves it.
+
+Edges are matched against the whole desktop's outer bounds, not the current
+monitor, so a multi-monitor setup only ever triggers at the far left and right.
+An edge left unset never switches. The section is absent and inert by default.
+
+Every host you switch from needs OpenLogi running with its own `[flow]`
+section. There is no clipboard transfer. macOS reports the
+pointer backend as unavailable and logs it once; the feature is Linux (X11) and
+Windows for now.
+
 ## Actions
 
 Action names are the serialized Rust variant names, including `Copy`,

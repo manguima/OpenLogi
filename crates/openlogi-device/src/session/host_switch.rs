@@ -25,8 +25,10 @@ use tokio::{
 };
 use tracing::{debug, info};
 
+mod hosts;
 mod restore;
 
+pub use hosts::read_host_table;
 use restore::rollback_host_switch_start;
 pub use restore::{
     HostSwitchRestoreOutcome, HostSwitchSessionFailure, HostSwitchSessionOutcome,

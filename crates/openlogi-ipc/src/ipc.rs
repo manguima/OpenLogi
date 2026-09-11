@@ -17,8 +17,8 @@ use openlogi_core::binding::{ActionRingIcon, ActionRingSlot};
 use openlogi_core::config::Lighting;
 use openlogi_core::device::{DeviceInventory, StandaloneDevice};
 use openlogi_core::hid::{
-    BacklightState, DeviceRoute, Dpi, DpiInfo, LightCommand, PairingError, PasskeyMethod,
-    ReceiverSelector, ScrollWheelMode, SmartShiftStatus, WriteError,
+    BacklightState, DeviceRoute, Dpi, DpiInfo, HostTable, LightCommand, PairingError,
+    PasskeyMethod, ReceiverSelector, ScrollWheelMode, SmartShiftStatus, WriteError,
 };
 use serde::{Deserialize, Serialize};
 pub use succession::Identity;
@@ -62,7 +62,7 @@ pub use succession::Identity;
 /// v29: `Agent::declare_client` + [`ClientKind`] appended — typed demand for
 ///      the macOS dormancy gate.
 /// v30: `Agent::read_wheel` and `Agent::read_backlight` appended.
-pub const PROTOCOL_VERSION: u32 = 30;
+pub const PROTOCOL_VERSION: u32 = 31;
 
 /// Environment variable through which the agent hands a supervised helper the
 /// run token it will serve, so the helper knows which agent it belongs to
@@ -565,4 +565,9 @@ pub trait Agent {
     async fn read_wheel(route: DeviceRoute) -> Result<ScrollWheelMode, WriteError>;
     /// Read the current keyboard-backlight state from `route`.
     async fn read_backlight(route: DeviceRoute) -> Result<BacklightState, WriteError>;
+    /// Read `route`'s host table — the Easy-Switch slots and their names.
+    ///
+    /// `Ok(None)` means the device does not report one, which is the normal
+    /// answer for a single-host device rather than a failure.
+    async fn read_hosts(route: DeviceRoute) -> Result<Option<HostTable>, WriteError>;
 }

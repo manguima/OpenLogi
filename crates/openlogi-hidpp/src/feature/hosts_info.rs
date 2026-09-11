@@ -142,12 +142,30 @@ pub struct HostInfo {
 pub struct HostDescriptorPage {
     /// Host slot index returned by the device.
     pub host_index: HostIndex,
-    /// Descriptor bus type, decoded from the page header when known.
-    pub bus_type: HostBusType,
-    /// Descriptor page index, decoded from the page header.
+    /// The page header byte, unsplit.
+    ///
+    /// Its high bits were read as a bus type, which they are not: an MX
+    /// Keys / ERGO K860 over BLE answers `0x80` for every paired slot, and 8
+    /// is not a bus type. Only the low nibble is understood here, so the rest
+    /// is handed over raw rather than decoded into something it is not.
+    pub header: u8,
+    /// Descriptor page index, from the low nibble of the header.
     pub page_index: u8,
     /// Raw descriptor body bytes.
     pub body: [u8; 14],
+}
+
+/// One chunk of a host's friendly name.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize))]
+#[non_exhaustive]
+pub struct HostFriendlyNameChunk {
+    /// Host slot index returned by the device.
+    pub host_index: HostIndex,
+    /// Offset into the name that this chunk starts at.
+    pub byte_index: u8,
+    /// Name bytes. Only the part up to the slot's `name_len` is meaningful.
+    pub chunk: [u8; 14],
 }
 
 /// Implements the `HostsInfo` / `0x1815` feature.
@@ -189,6 +207,32 @@ impl HostsInfoFeature {
         })
     }
 
+    /// Retrieves the friendly name of `host`, starting at `byte_index`.
+    ///
+    /// The name is read in chunks: the reply repeats the slot and the offset it
+    /// starts at, then carries up to 14 bytes of it. `getHostDescriptor` is a
+    /// different function that returns bus-specific pairing data — an ERGO K860
+    /// answers it with an all-zero body while holding a perfectly good name
+    /// here, so the two are not interchangeable.
+    pub async fn get_host_friendly_name(
+        &self,
+        host: HostIndex,
+        byte_index: u8,
+    ) -> Result<HostFriendlyNameChunk, Hidpp20Error> {
+        let payload = self
+            .endpoint
+            .call(3, [u8::from(host), byte_index, 0])
+            .await?
+            .extend_payload();
+        let mut chunk = [0; 14];
+        chunk.copy_from_slice(&payload[2..16]);
+        Ok(HostFriendlyNameChunk {
+            host_index: HostIndex::from(payload[0]),
+            byte_index: payload[1],
+            chunk,
+        })
+    }
+
     /// Retrieves a raw descriptor `page` for `host`.
     pub async fn get_host_descriptor(
         &self,
@@ -204,8 +248,7 @@ impl HostsInfoFeature {
         body.copy_from_slice(&payload[2..16]);
         Ok(HostDescriptorPage {
             host_index: HostIndex::from(payload[0]),
-            bus_type: HostBusType::try_from(payload[1] >> 4)
-                .map_err(|_| Hidpp20Error::UnsupportedResponse)?,
+            header: payload[1],
             page_index: payload[1] & 0x0f,
             body,
         })
