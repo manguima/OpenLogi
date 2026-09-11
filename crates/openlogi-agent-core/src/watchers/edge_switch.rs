@@ -13,8 +13,10 @@ use openlogi_core::config::{Edge, FlowConfig, HostChannel};
 use tokio::sync::watch;
 use tracing::{debug, warn};
 
+use crate::flow::{EdgeFraction, Handoff, seal::Seal, send};
 use crate::pointer::{Pointer, Sample};
 use crate::watchers::host_switch::HostSwitchRequester;
+use crate::watchers::host_table::HostTableView;
 
 /// Read-only, coalescing view of the live `[flow]` section.
 pub type FlowSettings = watch::Receiver<Arc<FlowConfig>>;
@@ -101,7 +103,7 @@ impl EdgeTracker {
 /// Owns a thread and a current-thread runtime, like the host-switch manager:
 /// the pointer round-trips are short and blocking, and keeping them off the
 /// shared runtime keeps a stalled display server from starving HID++ sessions.
-pub fn spawn(flow: &FlowSettings, requester: HostSwitchRequester) {
+pub fn spawn(flow: &FlowSettings, requester: HostSwitchRequester, hosts: HostTableView) {
     let mut flow = flow.clone();
     thread::spawn(move || {
         let runtime = match tokio::runtime::Builder::new_current_thread()
@@ -114,11 +116,15 @@ pub fn spawn(flow: &FlowSettings, requester: HostSwitchRequester) {
                 return;
             }
         };
-        runtime.block_on(watch_edges(&mut flow, &requester));
+        runtime.block_on(watch_edges(&mut flow, &requester, &hosts));
     });
 }
 
-async fn watch_edges(flow: &mut FlowSettings, requester: &HostSwitchRequester) {
+async fn watch_edges(
+    flow: &mut FlowSettings,
+    requester: &HostSwitchRequester,
+    hosts: &HostTableView,
+) {
     let mut pointer = None;
     let mut tracker = EdgeTracker::default();
 
@@ -164,6 +170,12 @@ async fn watch_edges(flow: &mut FlowSettings, requester: &HostSwitchRequester) {
                         channel = host.channel(),
                         "flow: edge reached — requesting host switch"
                     );
+                    // Hand off first. The frame reaches the peer in about a
+                    // millisecond while the radio takes hundreds, so the
+                    // pointer is already on the other screen by the time the
+                    // devices arrive. Reverse the two and the peer would land
+                    // it after the user had already seen the gap.
+                    hand_off(&config, hosts, sample, edge, host.index());
                     requester.request(host.index());
                 }
             }
@@ -176,6 +188,52 @@ async fn watch_edges(flow: &mut FlowSettings, requester: &HostSwitchRequester) {
 
         tokio::time::sleep(config.poll_interval()).await;
     }
+}
+
+/// Tell the peer that owns `host` where the pointer left, if one is reachable.
+///
+/// Spawned rather than awaited: the handoff exists to hide the radio's
+/// latency, so making the switch wait on it would defeat its own purpose.
+fn hand_off(config: &FlowConfig, hosts: &HostTableView, sample: Sample, edge: Edge, host: u8) {
+    if !config.peers.is_active() {
+        return;
+    }
+    let Some(secret) = config.peers.secret.clone() else {
+        return;
+    };
+    let Some(table) = hosts.borrow().clone() else {
+        debug!(host, "flow: no host table yet — switching without cover");
+        return;
+    };
+    let Some(name) = table
+        .slots
+        .iter()
+        .find(|slot| slot.index == host)
+        .and_then(|slot| slot.name.clone())
+    else {
+        debug!(
+            host,
+            "flow: that host slot has no name — switching without cover"
+        );
+        return;
+    };
+    let candidates = config.peers.candidates_for(&name);
+    let at = match edge {
+        Edge::Left | Edge::Right => {
+            EdgeFraction::between(sample.y, sample.bounds.min_y, sample.bounds.max_y)
+        }
+        Edge::Top | Edge::Bottom => {
+            EdgeFraction::between(sample.x, sample.bounds.min_x, sample.bounds.max_x)
+        }
+    };
+    let handoff = Handoff {
+        host,
+        left_through: edge,
+        at,
+    };
+    tokio::spawn(async move {
+        send::deliver(&handoff, &Seal::new(&secret), send::nonce(), &candidates).await;
+    });
 }
 
 #[cfg(test)]

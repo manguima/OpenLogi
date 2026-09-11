@@ -12,6 +12,7 @@
 
 pub mod listen;
 pub mod seal;
+pub mod send;
 pub mod wire;
 
 use openlogi_core::config::Edge;

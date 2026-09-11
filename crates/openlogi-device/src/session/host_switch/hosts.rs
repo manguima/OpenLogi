@@ -92,33 +92,43 @@ async fn read_slot(hosts_info: &HostsInfoFeature, index: u8) -> HostSlot {
     }
 }
 
-/// Assemble a slot's friendly name from its 14-byte descriptor pages.
+/// Read a slot's friendly name, one chunk at a time.
 ///
-/// The device reports the length separately from the pages, so the last page
-/// is truncated to it rather than trimmed of padding — a name may legitimately
-/// end in a byte that looks like padding.
+/// The device reports the length separately from the chunks, so the tail is
+/// truncated to it rather than trimmed of what looks like padding — a name may
+/// legitimately end in a byte that resembles filler.
 async fn read_name(hosts_info: &HostsInfoFeature, index: u8, name_len: u8) -> Option<String> {
     if name_len == 0 {
         return None;
     }
     let wanted = usize::from(name_len);
-    let mut raw = Vec::with_capacity(wanted);
-    let mut page = 0;
+    let mut raw: Vec<u8> = Vec::with_capacity(wanted);
     while raw.len() < wanted {
-        let descriptor = match timed_hidpp(
-            "reading host descriptor",
-            hosts_info.get_host_descriptor(HostIndex::Slot(index), page),
+        let offset = u8::try_from(raw.len()).ok()?;
+        let chunk = match timed_hidpp(
+            "reading host name",
+            hosts_info.get_host_friendly_name(HostIndex::Slot(index), offset),
         )
         .await
         {
-            Ok(descriptor) => descriptor,
+            Ok(chunk) => chunk,
             Err(error) => {
-                debug!(index, page, %error, "host name page unreadable; using what was read");
+                debug!(index, offset, %error, "host name chunk unreadable; using what was read");
                 break;
             }
         };
-        raw.extend_from_slice(&descriptor.body);
-        page = page.checked_add(1)?;
+        // A device that ignores the offset would loop forever handing back the
+        // same chunk; trust its own answer about where this one starts.
+        if usize::from(chunk.byte_index) != raw.len() {
+            debug!(
+                index,
+                asked = offset,
+                got = chunk.byte_index,
+                "host name chunk came back at the wrong offset"
+            );
+            break;
+        }
+        raw.extend_from_slice(&chunk.chunk);
     }
     raw.truncate(wanted);
     decode_name(&raw)

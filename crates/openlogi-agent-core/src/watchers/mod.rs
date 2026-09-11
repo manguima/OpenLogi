@@ -9,6 +9,7 @@ pub mod edge_switch;
 pub mod foreground_app;
 pub mod gesture;
 pub mod host_switch;
+pub mod host_table;
 pub mod input_monitoring;
 pub mod inventory;
 pub mod keyboard;

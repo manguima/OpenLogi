@@ -179,15 +179,24 @@ impl PeerConfig {
         *self == Self::default()
     }
 
-    /// Where to reach the host the device calls `name`.
+    /// Addresses to try for the host the device calls `name`, in order.
     ///
-    /// An explicit override wins; otherwise the name itself is the address,
-    /// which is what makes the common case need no configuration — the device
-    /// already stores what the other machine calls itself.
+    /// An explicit override is the only candidate when one is set. Otherwise
+    /// the name itself is tried, then the same name under `.local`: a device
+    /// stores the bare host name, while mDNS — the thing that actually answers
+    /// on a home network — only serves the `.local` form. Trying both is what
+    /// makes the common case need no configuration at all.
     #[must_use]
-    pub fn address_for(&self, name: &str) -> String {
-        let host = self.addresses.get(name).map_or(name, String::as_str);
-        format!("{host}:{}", self.port())
+    pub fn candidates_for(&self, name: &str) -> Vec<String> {
+        let port = self.port();
+        if let Some(address) = self.addresses.get(name) {
+            return vec![format!("{address}:{port}")];
+        }
+        let mut candidates = vec![format!("{name}:{port}")];
+        if !name.contains('.') {
+            candidates.push(format!("{name}.local:{port}"));
+        }
+        candidates
     }
 }
 
@@ -348,13 +357,26 @@ mod tests {
     }
 
     #[test]
-    fn the_device_stored_name_is_the_address_by_default() {
-        // The whole point: the device already knows what the other machine
-        // calls itself, so the common case needs no configuration.
+    fn a_bare_name_is_also_tried_under_local() {
+        // Measured on a stock Ubuntu resolver: the bare name a device stores
+        // goes to DNS and fails, while mDNS answers the same name under
+        // `.local`. Trying only one of the two would need an override on
+        // every ordinary home network.
         let peers = PeerConfig::default();
         assert_eq!(
-            peers.address_for("DESKTOP-0B5NC53"),
-            format!("DESKTOP-0B5NC53:{DEFAULT_PEER_PORT}")
+            peers.candidates_for("DESKTOP-0B5NC53"),
+            vec![
+                format!("DESKTOP-0B5NC53:{DEFAULT_PEER_PORT}"),
+                format!("DESKTOP-0B5NC53.local:{DEFAULT_PEER_PORT}"),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_name_that_already_has_a_domain_is_not_suffixed() {
+        assert_eq!(
+            PeerConfig::default().candidates_for("desk.example.com"),
+            vec![format!("desk.example.com:{DEFAULT_PEER_PORT}")]
         );
     }
 
@@ -367,10 +389,17 @@ mod tests {
         peers
             .addresses
             .insert("DESKTOP-0B5NC53".into(), "192.168.1.20".into());
-        assert_eq!(peers.address_for("DESKTOP-0B5NC53"), "192.168.1.20:40000");
         assert_eq!(
-            peers.address_for("LAPTOP-OM1TP89K"),
-            "LAPTOP-OM1TP89K:40000"
+            peers.candidates_for("DESKTOP-0B5NC53"),
+            vec!["192.168.1.20:40000".to_string()],
+            "an override replaces the candidates rather than extending them"
+        );
+        assert_eq!(
+            peers.candidates_for("LAPTOP-OM1TP89K"),
+            vec![
+                "LAPTOP-OM1TP89K:40000".to_string(),
+                "LAPTOP-OM1TP89K.local:40000".to_string(),
+            ]
         );
     }
 
@@ -404,8 +433,8 @@ mod tests {
         assert!(parsed.peers.is_active());
         assert_eq!(parsed.peers.port(), DEFAULT_PEER_PORT);
         assert_eq!(
-            parsed.peers.address_for("DESKTOP-0B5NC53"),
-            "192.168.1.20:59870"
+            parsed.peers.candidates_for("DESKTOP-0B5NC53"),
+            vec!["192.168.1.20:59870".to_string()]
         );
         assert_eq!(parsed.dwell_ms, FlowConfig::default().dwell_ms);
         Ok(())
