@@ -155,6 +155,19 @@ pub struct HostDescriptorPage {
     pub body: [u8; 14],
 }
 
+/// One chunk of a host's friendly name.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize))]
+#[non_exhaustive]
+pub struct HostFriendlyNameChunk {
+    /// Host slot index returned by the device.
+    pub host_index: HostIndex,
+    /// Offset into the name that this chunk starts at.
+    pub byte_index: u8,
+    /// Name bytes. Only the part up to the slot's `name_len` is meaningful.
+    pub chunk: [u8; 14],
+}
+
 /// Implements the `HostsInfo` / `0x1815` feature.
 #[derive(Clone, Feature)]
 #[creatable(id = 0x1815, version = 2)]
@@ -191,6 +204,32 @@ impl HostsInfoFeature {
             page_count: payload[3],
             name_len: payload[4],
             name_max_len: payload[5],
+        })
+    }
+
+    /// Retrieves the friendly name of `host`, starting at `byte_index`.
+    ///
+    /// The name is read in chunks: the reply repeats the slot and the offset it
+    /// starts at, then carries up to 14 bytes of it. `getHostDescriptor` is a
+    /// different function that returns bus-specific pairing data — an ERGO K860
+    /// answers it with an all-zero body while holding a perfectly good name
+    /// here, so the two are not interchangeable.
+    pub async fn get_host_friendly_name(
+        &self,
+        host: HostIndex,
+        byte_index: u8,
+    ) -> Result<HostFriendlyNameChunk, Hidpp20Error> {
+        let payload = self
+            .endpoint
+            .call(3, [u8::from(host), byte_index, 0])
+            .await?
+            .extend_payload();
+        let mut chunk = [0; 14];
+        chunk.copy_from_slice(&payload[2..16]);
+        Ok(HostFriendlyNameChunk {
+            host_index: HostIndex::from(payload[0]),
+            byte_index: payload[1],
+            chunk,
         })
     }
 
