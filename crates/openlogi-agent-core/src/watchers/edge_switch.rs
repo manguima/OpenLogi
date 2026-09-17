@@ -52,9 +52,25 @@ fn rebound_to(sample: Sample, edge: Edge, config: &FlowConfig) -> (i32, i32) {
 struct EdgeTracker {
     contact: Option<(Edge, Instant)>,
     cooldown_until: Option<Instant>,
+    /// Edge the pointer was just placed on by a peer, held disarmed until the
+    /// pointer is seen away from it.
+    arrived_on: Option<Edge>,
 }
 
 impl EdgeTracker {
+    /// Note that a peer just landed the pointer on `edge` of this desktop.
+    ///
+    /// A hand still travelling in the same direction crosses the landing inset
+    /// in milliseconds, so an inset alone only buys those few pixels: both
+    /// hosts would keep handing the pointer back while it rested on their
+    /// edges. Disarming the edge it arrived on — until the pointer actually
+    /// leaves it — is what makes going back a deliberate act rather than a
+    /// consequence of not moving.
+    fn arrived(&mut self, edge: Edge) {
+        self.arrived_on = Some(edge);
+        self.contact = None;
+    }
+
     /// Feed one observation; yields the edge and host once the dwell completes.
     fn observe(
         &mut self,
@@ -62,6 +78,16 @@ impl EdgeTracker {
         at: Option<Edge>,
         config: &FlowConfig,
     ) -> Option<(Edge, HostChannel)> {
+        match (self.arrived_on, at) {
+            // Still sitting on the edge the pointer arrived on.
+            (Some(arrived), Some(touching)) if arrived == touching => {
+                self.contact = None;
+                return None;
+            }
+            // Anywhere else — including another edge — re-arms it.
+            (Some(_), _) => self.arrived_on = None,
+            (None, _) => {}
+        }
         if self.cooldown_until.is_some_and(|until| now < until) {
             // Still settling from the last switch. Clearing the contact means a
             // pointer parked on the edge owes a full fresh dwell afterwards,
@@ -103,7 +129,12 @@ impl EdgeTracker {
 /// Owns a thread and a current-thread runtime, like the host-switch manager:
 /// the pointer round-trips are short and blocking, and keeping them off the
 /// shared runtime keeps a stalled display server from starving HID++ sessions.
-pub fn spawn(flow: &FlowSettings, requester: HostSwitchRequester, hosts: HostTableView) {
+pub fn spawn(
+    flow: &FlowSettings,
+    requester: HostSwitchRequester,
+    hosts: HostTableView,
+    arrivals: watch::Receiver<(u64, Option<Edge>)>,
+) {
     let mut flow = flow.clone();
     thread::spawn(move || {
         let runtime = match tokio::runtime::Builder::new_current_thread()
@@ -116,7 +147,7 @@ pub fn spawn(flow: &FlowSettings, requester: HostSwitchRequester, hosts: HostTab
                 return;
             }
         };
-        runtime.block_on(watch_edges(&mut flow, &requester, &hosts));
+        runtime.block_on(watch_edges(&mut flow, &requester, &hosts, &arrivals));
     });
 }
 
@@ -124,9 +155,11 @@ async fn watch_edges(
     flow: &mut FlowSettings,
     requester: &HostSwitchRequester,
     hosts: &HostTableView,
+    arrivals: &watch::Receiver<(u64, Option<Edge>)>,
 ) {
     let mut pointer = None;
     let mut tracker = EdgeTracker::default();
+    let mut seen_arrival = 0;
 
     loop {
         let config = Arc::clone(&flow.borrow_and_update());
@@ -155,6 +188,19 @@ async fn watch_edges(
         let Some(active) = pointer.as_mut() else {
             continue;
         };
+
+        // A peer may have landed the pointer since the last tick. Disarm the
+        // edge it landed on before judging where the pointer is now, or this
+        // tick would read the arrival as a departure.
+        {
+            let (generation, edge) = *arrivals.borrow();
+            if generation != seen_arrival {
+                seen_arrival = generation;
+                if let Some(edge) = edge {
+                    tracker.arrived(edge);
+                }
+            }
+        }
 
         match active.sample() {
             Ok(sample) => {
@@ -426,6 +472,74 @@ mod tests {
         assert_eq!(
             tracker.observe(
                 start + Duration::from_millis(1_310),
+                Some(Edge::Right),
+                &config
+            ),
+            Some((Edge::Right, channel(3)))
+        );
+    }
+
+    #[test]
+    fn an_arrival_disarms_the_edge_it_landed_on() {
+        // The reported symptom: a mouse left resting against the edge on both
+        // machines handed the pointer back and forth without anyone touching
+        // it. Arriving must not count as leaving.
+        let config = config();
+        let mut tracker = EdgeTracker::default();
+        let start = Instant::now();
+        tracker.arrived(Edge::Left);
+        for step in [0, 200, 1_000, 5_000] {
+            assert_eq!(
+                tracker.observe(
+                    start + Duration::from_millis(step),
+                    Some(Edge::Left),
+                    &config
+                ),
+                None,
+                "resting on the edge it arrived on must never fire"
+            );
+        }
+    }
+
+    #[test]
+    fn leaving_the_arrival_edge_rearms_it() {
+        let config = config();
+        let mut tracker = EdgeTracker::default();
+        let start = Instant::now();
+        tracker.arrived(Edge::Left);
+        assert_eq!(tracker.observe(start, Some(Edge::Left), &config), None);
+        // Pointer moves off the edge — going back is now deliberate.
+        assert_eq!(
+            tracker.observe(start + Duration::from_millis(10), None, &config),
+            None
+        );
+        assert_eq!(
+            tracker.observe(start + Duration::from_millis(20), Some(Edge::Left), &config),
+            None,
+            "the fresh contact still owes its dwell"
+        );
+        assert_eq!(
+            tracker.observe(
+                start + Duration::from_millis(130),
+                Some(Edge::Left),
+                &config
+            ),
+            Some((Edge::Left, channel(1)))
+        );
+    }
+
+    #[test]
+    fn arriving_on_one_edge_leaves_the_others_armed() {
+        // Arriving from the left must not stop the user carrying on to the
+        // right; only the edge behind them is held.
+        let config = config();
+        let mut tracker = EdgeTracker::default();
+        let start = Instant::now();
+        tracker.arrived(Edge::Left);
+        assert_eq!(tracker.observe(start, Some(Edge::Right), &config), None);
+        assert_eq!(
+            tracker.observe(
+                start + Duration::from_millis(120),
                 Some(Edge::Right),
                 &config
             ),

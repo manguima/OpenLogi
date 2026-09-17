@@ -8,6 +8,7 @@ use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
+use openlogi_core::config::Edge;
 use tokio::io::AsyncReadExt as _;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::watch;
@@ -34,12 +35,19 @@ const READ_TIMEOUT: Duration = Duration::from_secs(2);
 /// directly, so an unknown slot accepts and says so.
 pub type OwnSlot = watch::Receiver<Option<u8>>;
 
+/// Announces where a peer just landed the pointer, so the local edge watcher
+/// can hold that edge disarmed until the pointer leaves it.
+///
+/// Carries a counter beside the edge because two arrivals on the same edge are
+/// two events, and a watch channel only reports that its value changed.
+pub type Arrivals = watch::Sender<(u64, Option<Edge>)>;
+
 /// Spawn the peer listener.
 ///
 /// Owns a thread and a current-thread runtime for the same reason the edge
 /// watcher does: a warp is a blocking display-server round trip, and it has no
 /// business sharing a runtime with the HID++ sessions.
-pub fn spawn(flow: &FlowSettings, slot: OwnSlot) {
+pub fn spawn(flow: &FlowSettings, slot: OwnSlot, arrivals: Arrivals) {
     let mut flow = flow.clone();
     thread::spawn(move || {
         let runtime = match tokio::runtime::Builder::new_current_thread()
@@ -52,11 +60,11 @@ pub fn spawn(flow: &FlowSettings, slot: OwnSlot) {
                 return;
             }
         };
-        runtime.block_on(serve(&mut flow, &slot));
+        runtime.block_on(serve(&mut flow, &slot, &arrivals));
     });
 }
 
-async fn serve(flow: &mut FlowSettings, slot: &OwnSlot) {
+async fn serve(flow: &mut FlowSettings, slot: &OwnSlot, arrivals: &Arrivals) {
     loop {
         let config = Arc::clone(&flow.borrow_and_update());
         let Some(secret) = config
@@ -106,7 +114,7 @@ async fn serve(flow: &mut FlowSettings, slot: &OwnSlot) {
                 accepted = listener.accept() => match accepted {
                     Ok((stream, from)) => {
                         debug!(%from, "flow: peer connected");
-                        land(stream, &seal, &mut guard, slot, inset).await;
+                        land(stream, &seal, &mut guard, slot, inset, arrivals).await;
                     }
                     Err(error) => {
                         warn!(%error, "flow: peer accept failed");
@@ -129,6 +137,7 @@ async fn land(
     guard: &mut ReplayGuard,
     slot: &OwnSlot,
     inset: i32,
+    arrivals: &Arrivals,
 ) {
     let mut frame = [0; FRAME_LEN];
     match timeout(READ_TIMEOUT, stream.read_exact(&mut frame)).await {
@@ -189,7 +198,14 @@ async fn land(
         inset,
     );
     match pointer.warp(x, y) {
-        Ok(()) => debug!(x, y, ?handoff.left_through, "flow: pointer landed from peer"),
+        Ok(()) => {
+            let landed_on = crate::flow::opposite(handoff.left_through);
+            arrivals.send_modify(|(generation, edge)| {
+                *generation = generation.wrapping_add(1);
+                *edge = Some(landed_on);
+            });
+            debug!(x, y, ?landed_on, "flow: pointer landed from peer");
+        }
         Err(error) => warn!(%error, "flow: pointer landing failed"),
     }
 }
