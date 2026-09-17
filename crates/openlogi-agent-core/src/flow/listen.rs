@@ -81,9 +81,7 @@ async fn serve(flow: &mut FlowSettings, slot: &OwnSlot, arrivals: &Arrivals) {
         };
         let seal = Seal::new(secret);
         let port = config.peers.port();
-        // The same distance the watcher rebounds by: one knob for "how far
-        // clear of an edge the pointer has to be", used on both sides of it.
-        let inset = i32::from(config.rebound_px);
+        let inset = i32::from(config.landing_px);
 
         let listener = match TcpListener::bind(("0.0.0.0", port)).await {
             Ok(listener) => {

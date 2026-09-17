@@ -227,6 +227,14 @@ pub struct FlowConfig {
     /// Dead time after a switch. Covers the device reconnect, which is hundreds
     /// of milliseconds on Bluetooth and during which a second trigger is noise.
     pub cooldown_ms: u16,
+    /// How far inside the screen a handoff from a peer lands.
+    ///
+    /// Small on purpose: the arriving edge is held disarmed until the pointer
+    /// leaves it, so this no longer has to keep the pointer clear of its own
+    /// trigger — it only has to avoid the boundary pixel itself, where hot
+    /// corners and scrollbars live. A large value would read as the cursor
+    /// jumping inward instead of continuing across.
+    pub landing_px: u16,
     /// Pointer sampling rate.
     pub poll_hz: u16,
     /// The peer link that makes a switch look instant.
@@ -242,6 +250,7 @@ impl Default for FlowConfig {
             dwell_ms: 120,
             rebound_px: 8,
             cooldown_ms: 1500,
+            landing_px: 1,
             poll_hz: 60,
             peers: PeerConfig::default(),
         }

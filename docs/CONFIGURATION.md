@@ -95,6 +95,7 @@ host-switch link, so a keyboard with no targets configured has nothing to move.
 enabled = true
 dwell_ms = 120      # how long the pointer must hold against the edge
 rebound_px = 8      # how far it is pulled back afterwards
+landing_px = 1      # how far inside the screen a handoff from a peer lands
 cooldown_ms = 1500  # dead time covering the device reconnect
 poll_hz = 60
 

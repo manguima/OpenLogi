@@ -114,9 +114,11 @@ impl Handoff {
     /// Where the arriving host should place its pointer, given its own bounds.
     ///
     /// `inset` pulls the landing just inside the screen instead of onto the
-    /// boundary pixel. Landing exactly on the edge is what the local edge
-    /// watcher is watching for, so an arrival there reads as a departure and
-    /// the two hosts bounce the pointer back and forth forever.
+    /// boundary pixel, where hot corners and scrollbars live. It is deliberately
+    /// tiny: what stops the two hosts bouncing the pointer between them is the
+    /// arriving edge staying disarmed until the pointer leaves it, not distance.
+    /// A large inset would read as the cursor jumping inward rather than
+    /// continuing across.
     #[must_use]
     pub fn landing(&self, bounds: (i32, i32, i32, i32), inset: i32) -> (i32, i32) {
         let (min_x, min_y, max_x, max_y) = bounds;
