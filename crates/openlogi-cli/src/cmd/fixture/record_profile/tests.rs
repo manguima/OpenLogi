@@ -8,8 +8,8 @@ use openlogi_core::binding::ActionRingSlot;
 use openlogi_core::config::Lighting;
 use openlogi_core::device::DeviceInventory;
 use openlogi_core::hid::{
-    BacklightMode, BacklightState, BacklightStatus, Dpi, DpiInfo, LightCommand, PasskeyMethod,
-    ReceiverSelector, ScrollWheelMode, SmartShiftStatus,
+    BacklightMode, BacklightState, BacklightStatus, Dpi, DpiInfo, HostTable, LightCommand,
+    PasskeyMethod, ReceiverSelector, ScrollWheelMode, SmartShiftStatus,
 };
 use openlogi_fixture::{
     CANONICAL_DEVICE_PROFILE_JSON, SyntheticIdentityKind, classify_synthetic_identity_bytes,
@@ -283,6 +283,16 @@ impl Agent for TestAgent {
             |settings| &settings.backlight,
             0x1982,
         )
+    }
+
+    /// A semantic profile carries no host table, so the double answers the way
+    /// a single-host device does instead of panicking on a harmless read.
+    async fn read_hosts(
+        self,
+        _: TarpcContext,
+        _route: DeviceRoute,
+    ) -> Result<Option<HostTable>, WriteError> {
+        Ok(None)
     }
 }
 
@@ -666,8 +676,16 @@ async fn protocol_mismatch_aborts_before_snapshot_or_output() {
         .expect_err("protocol mismatch must abort")
         .to_string();
 
-    assert!(error.contains("protocol v29"), "{error}");
-    assert!(error.contains("requires v30"), "{error}");
+    // Derived, not spelled out: the test asserts the mismatch is reported,
+    // and a protocol bump is not supposed to be a reason to edit it.
+    assert!(
+        error.contains(&format!("protocol v{}", PROTOCOL_VERSION - 1)),
+        "{error}"
+    );
+    assert!(
+        error.contains(&format!("requires v{PROTOCOL_VERSION}")),
+        "{error}"
+    );
     assert_eq!(*inspection.snapshots.lock().expect("snapshot lock"), 0);
     assert!(!output.exists());
 }

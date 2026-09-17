@@ -208,13 +208,24 @@ pub(crate) fn spawn_hidpp_watchers(
             shared.hook_maps.clone(),
         ),
     );
-    let host_switch = watchers::host_switch::spawn(
+    let (host_switch, host_switch_requester) = watchers::host_switch::spawn(
         &shared.host_switch_links,
         shared.channel_pool.clone(),
         shared.receiver_access.clone(),
         shared.channel_registry.clone(),
         shared.device_io.clone(),
     );
+    let host_table = watchers::host_table::spawn(
+        &shared.host_switch_links,
+        shared.channel_pool.clone(),
+        shared.device_io.clone(),
+    );
+    // The listener announces where a peer landed the pointer; the edge watcher
+    // holds that edge disarmed until the pointer leaves it, so two hosts cannot
+    // hand it back and forth while it rests on their edges.
+    let (arrivals_tx, arrivals_rx) = tokio::sync::watch::channel((0, None));
+    openlogi_agent_core::flow::listen::spawn(&shared.flow, shared.flow_slot.clone(), arrivals_tx);
+    watchers::edge_switch::spawn(&shared.flow, host_switch_requester, host_table, arrivals_rx);
     let keyboard = watchers::keyboard::spawn(
         &shared.keyboard_spec,
         shared.keyboard_channel.clone(),

@@ -235,6 +235,19 @@ impl Agent for AgentServer {
             .await
     }
 
+    async fn read_hosts(
+        self,
+        _: Context,
+        route: DeviceRoute,
+    ) -> Result<Option<openlogi_core::hid::HostTable>, WriteError> {
+        openlogi_hid::session::host_switch::read_host_table(&route, &self.shared.channel_pool)
+            .await
+            .map_err(|error| {
+                warn!(%error, %route, "host table read failed");
+                WriteError::DeviceNotFound
+            })
+    }
+
     async fn request_accessibility_prompt(self, _: Context) {
         Hook::prompt_accessibility();
     }
